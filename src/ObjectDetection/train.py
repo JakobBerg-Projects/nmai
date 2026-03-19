@@ -15,7 +15,7 @@ if __name__ == "__main__":
     train_imgs = Path("data/images/train")
     if not train_imgs.exists() or not any(train_imgs.iterdir()):
         print("Preparing dataset...")
-        from prepare_dataset import prepare, write_yaml
+        from ObjectDetection.prepare_dataset import prepare, write_yaml
         categories, cat_ids = prepare()
         write_yaml(categories, cat_ids)
 
