@@ -111,7 +111,7 @@ class LLMClient:
 
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "temperature": 0,
             "messages": conversation,
         }

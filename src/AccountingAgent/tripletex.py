@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -39,7 +40,8 @@ class TripletexClient:
         url = f"{self._base_url}{path}"
         method = method.upper()
 
-        logger.info("Tripletex %s %s params=%s", method, path, params)
+        logger.info("Tripletex %s %s params=%s body=%s", method, path, params,
+                    json.dumps(json_body, ensure_ascii=False) if json_body else None)
 
         response = await self._client.request(
             method=method,
