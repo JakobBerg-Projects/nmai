@@ -48,8 +48,20 @@ case "$GPU_TYPE" in
     ACCELERATOR="type=nvidia-l4,count=1"
     MACHINE_TYPE="g2-standard-8"
     ;;
+  a100)
+    ACCELERATOR="type=nvidia-tesla-a100,count=1"
+    MACHINE_TYPE="a2-highgpu-1g"
+    ;;
+  a100-80)
+    ACCELERATOR="type=nvidia-a100-80gb,count=1"
+    MACHINE_TYPE="a2-ultragpu-1g"
+    ;;
+  h100)
+    ACCELERATOR="type=nvidia-h100-80gb,count=1"
+    MACHINE_TYPE="a3-highgpu-1g"
+    ;;
   *)
-    echo "Unsupported GPU: $GPU_TYPE (use t4 or l4)"
+    echo "Unsupported GPU: $GPU_TYPE (use t4, l4, a100, a100-80, h100)"
     exit 1
     ;;
 esac
