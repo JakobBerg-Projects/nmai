@@ -1,0 +1,29 @@
+# ── Data (large files – not committed) ───────────────────────────────────────
+data/raw/
+data/product_images/
+data/images/
+data/labels/
+
+# ── YOLO outputs ──────────────────────────────────────────────────────────────
+runs/
+
+# ── Model weights ─────────────────────────────────────────────────────────────
+*.pt
+*.pth
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ── OS / editors ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
