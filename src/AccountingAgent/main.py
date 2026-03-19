@@ -90,6 +90,31 @@ async def solve(
 
     _log_submission(prompt, file_names, summary, request_start)
 
+    # Persist detailed call log for post-mortem analysis
+    try:
+        import os
+        log_dir = "/tmp/task_logs"
+        os.makedirs(log_dir, exist_ok=True)
+        with open(f"{log_dir}/api_calls.jsonl", "a") as fh:
+            fh.write(json.dumps({
+                "task_id": task_id,
+                "total_api_calls": summary.get("total_api_calls", 0),
+                "error_count": summary.get("error_count", 0),
+                "exit_reason": summary.get("exit_reason", "unknown"),
+                "elapsed_seconds": summary.get("elapsed_seconds", 0),
+                "calls": [
+                    {
+                        "method": c.get("method", "?"),
+                        "path": c.get("path", "?"),
+                        "status": c.get("status_code", 0),
+                        **({"error_type": c["error_type"]} if c.get("is_error") else {}),
+                    }
+                    for c in summary.get("api_calls", [])
+                ],
+            }, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        logger.warning("Failed to write API call log")
+
     return JSONResponse({"status": "completed"})
 
 

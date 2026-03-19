@@ -38,7 +38,8 @@ _DONE_PATTERN = re.compile(r"\bTASK_COMPLETE\b")
 # Use negative lookahead to avoid matching inside email addresses or domain names.
 _KEYWORDS_VAT = re.compile(
     r"(?<![.\w@])\b(mva|vat|merverdiavgift|faktura|invoice|produkt|product|ordre|order"
-    r"|Rechnung|impuesto|steuer|tax|fatura|factura)\b(?![.\w@])",
+    r"|Rechnung|impuesto|steuer|tax|fatura|factura|kreditnota|credit.?note|gutschrift"
+    r"|leverandørfaktura|supplier.?invoice)\b(?![.\w@])",
     re.IGNORECASE,
 )
 _KEYWORDS_PAYMENT = re.compile(
@@ -87,7 +88,6 @@ async def run_agent(
 
         remaining = deadline - time.monotonic()
         try:
-            # Keep conversation manageable: system + first user msg + last 30 messages
             pruned = _prune_messages(messages)
             response: LLMResponse = await asyncio.wait_for(
                 llm.chat(pruned, TOOLS),
@@ -97,8 +97,16 @@ async def run_agent(
             logger.warning("LLM call timed out at iteration %d", iteration)
             break
         except Exception:
-            logger.exception("LLM call failed at iteration %d", iteration)
-            break
+            logger.exception("LLM call failed at iteration %d, retrying once", iteration)
+            await asyncio.sleep(2)
+            try:
+                response = await asyncio.wait_for(
+                    llm.chat(pruned, TOOLS),
+                    timeout=max(deadline - time.monotonic(), 5),
+                )
+            except Exception:
+                logger.exception("LLM retry also failed at iteration %d", iteration)
+                break
 
         if not response.tool_calls:
             logger.info(
@@ -207,28 +215,34 @@ async def _prefetch_reference_data(
     needs_payment = bool(_KEYWORDS_PAYMENT.search(prompt))
     needs_travel = bool(_KEYWORDS_TRAVEL.search(prompt))
     needs_ledger = bool(_KEYWORDS_LEDGER.search(prompt))
+    needs_country = bool(re.search(
+        r"\b(adress|address|postalCode|poststed|city|land|country|Norge|Norway"
+        r"|fysisk|physical|postal|leveringsadresse|delivery"
+        r"|kunde|customer|client|leverandør|supplier|ansatt|employee"
+        r"|faktura|invoice|reiseregning|travel)"
+        r"\b", prompt, re.IGNORECASE,
+    ))
+
+    if needs_country:
+        tasks.append(("country_no", "/country", {"code": "NO", "fields": "id,name"}))
 
     if needs_vat:
         tasks.append(("vat_types", "/ledger/vatType", {
             "count": 50, "fields": "id,number,name,percentage",
             "typeOfVat": "OUTGOING",
         }))
-    if needs_payment:
+    if needs_payment or needs_vat:
         tasks.append(("payment_types", "/invoice/paymentType", {"count": 50, "fields": "id,description"}))
     if needs_travel:
         tasks.append(("cost_categories", "/travelExpense/costCategory", {"count": 50, "fields": "id,name,number"}))
         tasks.append(("travel_payment_types", "/travelExpense/paymentType", {"count": 50, "fields": "id,description"}))
     if needs_ledger:
-        # Pre-fetch common accounts for ledger/reconciliation tasks
         tasks.append(("bank_accounts", "/ledger/account", {
             "count": 50,
             "fields": "id,number,name,isBankAccount",
             "isBankAccount": True,
         }))
         tasks.append(("voucher_types", "/ledger/voucherType", {"count": 30, "fields": "id,name"}))
-
-    if not tasks:
-        return ref_data
 
     # Fetch all reference data in parallel
     results = await asyncio.gather(*[
@@ -267,6 +281,14 @@ async def _prefetch_reference_data(
 def _format_ref_data_context(ref_data: dict[str, Any]) -> str:
     """Format pre-fetched reference data as context for the LLM."""
     parts: list[str] = []
+
+    if "country_no" in ref_data:
+        countries = ref_data["country_no"]
+        if countries:
+            c = countries[0] if isinstance(countries, list) else countries
+            parts.append(f"## Norway Country Reference: id={c.get('id')}")
+            parts.append("Use {id: " + str(c.get('id')) + "} for country in addresses.")
+            parts.append("")
 
     if "vat_types" in ref_data:
         parts.append("## Pre-fetched OUTGOING VAT Types (from GET /ledger/vatType)")
@@ -435,7 +457,7 @@ async def _execute_tool(
     try:
         resp = await tripletex.request(method, path, params=params, json_body=json_body)
 
-        # Retry on rate limit or transient server errors (competition servers can be flaky)
+        # Retry on rate limit or transient server errors
         if resp.status_code == 429:
             logger.warning("Rate limited on %s %s, retrying after 3s", method, path)
             await asyncio.sleep(3)
@@ -444,6 +466,15 @@ async def _execute_tool(
             logger.warning("Server error %d on %s %s, retrying after 2s", resp.status_code, method, path)
             await asyncio.sleep(2)
             resp = await tripletex.request(method, path, params=params, json_body=json_body)
+
+        # Auto-fix common validation errors and retry once
+        if resp.status_code == 422 and json_body and method in ("POST", "PUT"):
+            fixed_body = _auto_fix_validation(path, json_body, resp.body)
+            if fixed_body is not None:
+                logger.info("Auto-fixing validation error on %s %s, retrying", method, path)
+                resp = await tripletex.request(method, path, params=params, json_body=fixed_body)
+                if resp.ok:
+                    json_body = fixed_body
 
     except Exception as exc:
         error_result = json.dumps({"error": f"Request failed: {exc}"})
@@ -467,6 +498,13 @@ async def _execute_tool(
         else:
             cache_key = f"{path}?{json.dumps(params or {}, sort_keys=True)}"
         get_cache[cache_key] = (serialized, dict(call_info))
+
+    # Invalidate relevant GET caches after successful mutations
+    if method in ("POST", "PUT", "DELETE") and resp.ok and get_cache is not None:
+        base_path = "/" + path.strip("/").split("/")[0]
+        stale_keys = [k for k in get_cache if k.startswith(base_path) and k not in _REFERENCE_ENDPOINTS]
+        for k in stale_keys:
+            del get_cache[k]
 
     return serialized, call_info
 
@@ -498,14 +536,152 @@ def _smart_serialize(result: dict[str, Any], max_len: int = 12000) -> str:
     return serialized
 
 
-def _prune_messages(messages: list[dict[str, Any]], max_tail: int = 20) -> list[dict[str, Any]]:
-    """Keep system message + first user message + last N messages to reduce token usage."""
+def _prune_messages(messages: list[dict[str, Any]], max_tail: int = 40) -> list[dict[str, Any]]:
+    """Keep system + first user + important middle messages + last N messages.
+
+    Important messages are those containing POST/PUT responses with entity IDs
+    that the LLM may need later. We extract a compact summary of those and inject
+    it so the LLM never loses track of created entities.
+    """
     if len(messages) <= max_tail + 2:
         return messages
-    # Always keep: system (index 0) and first user message (index 1)
+
     head = messages[:2]
-    tail = messages[-(max_tail):]
+    tail = messages[-max_tail:]
+    middle = messages[2:-max_tail]
+
+    created_entities: list[str] = []
+    key_api_results: list[str] = []
+    for msg in middle:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                c.get("content", "") if isinstance(c, dict) else str(c)
+                for c in content
+            )
+        if not isinstance(content, str):
+            continue
+        if '"status_code": 201' in content or '"status_code": 200' in content:
+            try:
+                parsed = json.loads(content)
+                body = parsed.get("body", {})
+                value = body.get("value", body)
+                if isinstance(value, dict) and "id" in value:
+                    name = value.get("name", value.get("firstName", ""))
+                    eid = value.get("id")
+                    ver = value.get("version", "")
+                    entry = f"id={eid}"
+                    if ver:
+                        entry += f",version={ver}"
+                    if name:
+                        entry += f",name={name}"
+                    url = value.get("url", "")
+                    if url:
+                        # Extract entity type from URL like /v2/customer/123
+                        parts = url.strip("/").split("/")
+                        if len(parts) >= 2:
+                            entry = f"{parts[-2]}:{entry}"
+                    created_entities.append(entry)
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+        # Track invoice IDs specifically (from :invoice actions)
+        if '"status_code": 200' in content and '"invoiceNumber"' in content:
+            try:
+                parsed = json.loads(content)
+                body = parsed.get("body", {})
+                value = body.get("value", body)
+                if isinstance(value, dict) and "id" in value:
+                    inv_id = value.get("id")
+                    inv_num = value.get("invoiceNumber", "")
+                    key_api_results.append(f"invoice id={inv_id},number={inv_num}")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+
+    summary_parts: list[str] = []
+    if created_entities:
+        summary_parts.append(
+            "Entities created so far: " + "; ".join(created_entities[:30])
+        )
+    if key_api_results:
+        summary_parts.append(
+            "Key results: " + "; ".join(key_api_results[:10])
+        )
+    if summary_parts:
+        summary_text = "[Context from earlier calls — " + ". ".join(summary_parts) + "]"
+        head.append({"role": "user", "content": summary_text})
+
     return head + tail
+
+
+def _auto_fix_validation(path: str, json_body: dict[str, Any], error_body: Any) -> dict[str, Any] | None:
+    """Attempt to auto-fix common validation errors. Returns corrected body or None."""
+    if not isinstance(error_body, dict):
+        return None
+
+    msgs = error_body.get("validationMessages", [])
+    if not isinstance(msgs, list) or not msgs:
+        return None
+
+    error_fields = {m.get("field", ""): m.get("message", "") for m in msgs if isinstance(m, dict)}
+    fixed = dict(json_body)
+    changed = False
+
+    if "/employee" in path:
+        if "userType" in error_fields and "userType" not in fixed:
+            fixed["userType"] = "STANDARD"
+            changed = True
+        if any("isCustomer" in f for f in error_fields):
+            fixed["isCustomer"] = True
+            changed = True
+
+    if "/customer" in path:
+        if any("isCustomer" in f for f in error_fields) and not fixed.get("isCustomer"):
+            fixed["isCustomer"] = True
+            changed = True
+
+    if "/order" in path:
+        if "deliveryDate" in error_fields and "deliveryDate" not in fixed:
+            fixed["deliveryDate"] = date.today().isoformat()
+            changed = True
+        if "orderDate" in error_fields and "orderDate" not in fixed:
+            fixed["orderDate"] = date.today().isoformat()
+            changed = True
+        if "isPrioritizeAmountsIncludingVat" not in fixed:
+            fixed["isPrioritizeAmountsIncludingVat"] = False
+            changed = True
+
+    if "/invoice" in path:
+        if "invoiceDate" in error_fields and "invoiceDate" not in fixed:
+            fixed["invoiceDate"] = date.today().isoformat()
+            changed = True
+        if "invoiceDueDate" in error_fields and "invoiceDueDate" not in fixed:
+            fixed["invoiceDueDate"] = date.today().isoformat()
+            changed = True
+
+    if "/supplier" in path:
+        if any("isSupplier" in f for f in error_fields) and not fixed.get("isSupplier"):
+            fixed["isSupplier"] = True
+            changed = True
+
+    if "/contact" in path:
+        if "firstName" in error_fields and "firstName" not in fixed:
+            fixed["firstName"] = "Unknown"
+            changed = True
+        if "lastName" in error_fields and "lastName" not in fixed:
+            fixed["lastName"] = "Unknown"
+            changed = True
+
+    if "/project" in path:
+        if "name" in error_fields and "name" not in fixed:
+            fixed["name"] = "Project"
+            changed = True
+
+    if "/department" in path:
+        if "name" in error_fields and "name" not in fixed:
+            fixed["name"] = "Default"
+            changed = True
+
+    return fixed if changed else None
 
 
 def _classify_error(status_code: int, body: Any) -> str:
@@ -548,6 +724,9 @@ _ERROR_RECOVERY_HINTS: dict[str, dict[str, str]] = {
         "invoiceDueDate": "invoiceDueDate is required. Use YYYY-MM-DD format.",
         "customer": "customer is required. Create a customer first with POST /customer.",
         "orders": "orders is required for POST /invoice. Create an order first.",
+        "isPrioritizeAmountsIncludingVat": "Set isPrioritizeAmountsIncludingVat: false (excl VAT) or true (incl VAT) on the order.",
+        "organizationNumber": "Include organizationNumber if the task provides an org number.",
+        "isSupplier": "Include isSupplier: true when creating a supplier.",
         "firstName": "firstName is required for POST /employee or POST /contact.",
         "lastName": "lastName is required for POST /employee or POST /contact.",
         "name": "name is required. Check the task prompt for the correct name.",

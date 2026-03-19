@@ -16,6 +16,6 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
 ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
-AGENT_MAX_ITERATIONS: int = int(os.getenv("AGENT_MAX_ITERATIONS", "30"))
-AGENT_TIMEOUT_SECONDS: float = float(os.getenv("AGENT_TIMEOUT_SECONDS", "270"))
+AGENT_MAX_ITERATIONS: int = int(os.getenv("AGENT_MAX_ITERATIONS", "50"))
+AGENT_TIMEOUT_SECONDS: float = float(os.getenv("AGENT_TIMEOUT_SECONDS", "290"))
 TRIPLETEX_REQUEST_TIMEOUT: float = float(os.getenv("TRIPLETEX_REQUEST_TIMEOUT", "30"))
