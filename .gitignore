@@ -1,8 +1,5 @@
 # ── Data (large files – not committed) ───────────────────────────────────────
-data/raw/
-data/product_images/
-data/images/
-data/labels/
+**/data/
 
 # ── YOLO outputs ──────────────────────────────────────────────────────────────
 runs/
