@@ -12,7 +12,10 @@ TOOLS: list[dict] = [
             "description": (
                 "Make an HTTP request to the Tripletex v2 REST API. "
                 "Use this tool for every interaction with Tripletex: "
-                "creating, reading, updating, and deleting resources."
+                "creating, reading, updating, and deleting resources. "
+                "IMPORTANT: For action endpoints like :payment, :createCreditNote, "
+                ":invoice, :deliver — use 'params' for the required parameters, "
+                "NOT 'json_body'. These actions take query parameters only."
             ),
             "parameters": {
                 "type": "object",
@@ -33,7 +36,9 @@ TOOLS: list[dict] = [
                         "type": "object",
                         "description": (
                             "Query parameters as key-value pairs. "
-                            "Use for GET filters like fields, count, from, name, etc."
+                            "Use for GET filters (fields, count, from, name, etc.) AND "
+                            "for action endpoint parameters like paymentDate, paymentTypeId, "
+                            "paidAmount, date, invoiceDate, employeeId, template, id, etc."
                         ),
                         "additionalProperties": True,
                     },
