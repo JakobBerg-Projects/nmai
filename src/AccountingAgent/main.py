@@ -46,6 +46,7 @@ async def solve(
     prompt: str = body.get("prompt", "")
     files: list[dict] = body.get("files", [])
     creds: dict = body.get("tripletex_credentials", {})
+    task_id: str = body.get("task_id", body.get("taskId", body.get("task_type", "")))
 
     base_url: str = creds.get("base_url", "")
     session_token: str = creds.get("session_token", "")
@@ -56,7 +57,20 @@ async def solve(
             detail="Missing required fields: prompt, tripletex_credentials.base_url, tripletex_credentials.session_token",
         )
 
-    logger.info("Received task: %.200s", prompt)
+    # Log the FULL prompt and all body keys to file for debugging
+    import os
+    log_dir = "/tmp/task_logs"
+    os.makedirs(log_dir, exist_ok=True)
+    body_keys = [k for k in body.keys() if k != "tripletex_credentials"]
+    with open(f"{log_dir}/tasks.jsonl", "a") as fh:
+        fh.write(json.dumps({
+            "task_id": task_id,
+            "body_keys": body_keys,
+            "files": [f.get("filename") for f in files],
+            "prompt": prompt,
+        }, ensure_ascii=False) + "\n")
+
+    logger.info("Received task_id=%r keys=%s prompt=%.400s", task_id, body_keys, prompt)
     request_start = time.time()
 
     extracted_files = process_files(files)

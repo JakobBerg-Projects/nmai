@@ -19,18 +19,41 @@ from tripletex import TripletexClient
 
 logger = logging.getLogger(__name__)
 
+# Reference endpoints whose cached result should be returned regardless of query params.
+# The LLM often re-fetches these with different `fields` values, causing unnecessary calls.
+_REFERENCE_ENDPOINTS: frozenset[str] = frozenset({
+    "/ledger/vatType",
+    "/invoice/paymentType",
+    "/travelExpense/costCategory",
+    "/travelExpense/paymentType",
+    "/ledger/voucherType",
+})
+
+# Only match the explicit TASK_COMPLETE signal we asked the LLM to emit.
+# Broad natural-language patterns like "task is complete" are too risky — they can
+# appear mid-reasoning and cause early exit with 0 score.
+_DONE_PATTERN = re.compile(r"\bTASK_COMPLETE\b")
+
+# Keywords that trigger pre-fetching of reference data.
+# Use negative lookahead to avoid matching inside email addresses or domain names.
 _KEYWORDS_VAT = re.compile(
     r"(?<![.\w@])\b(mva|vat|merverdiavgift|faktura|invoice|produkt|product|ordre|order"
-    r"|Rechnung|impuesto|steuer|tax)\b(?![.\w@])",
+    r"|Rechnung|impuesto|steuer|tax|fatura|factura)\b(?![.\w@])",
     re.IGNORECASE,
 )
 _KEYWORDS_PAYMENT = re.compile(
-    r"\b(betaling|payment|pago|Zahlung|pagamento|paiement|innbetaling)\b",
+    r"\b(betaling|payment|pago|Zahlung|pagamento|paiement|innbetaling|betal)\b",
     re.IGNORECASE,
 )
 _KEYWORDS_TRAVEL = re.compile(
-    r"\b(reiseregning|travel.?expense|reisekostenabrechnung|gastos.?de.?viaje"
-    r"|despesas.?de.?viagem|note.?de.?frais)\b",
+    r"\b(reiseregning|reiserekning|travel.?expense|reisekostenabrechnung|gastos.?de.?viaje"
+    r"|despesas.?de.?viagem|note.?de.?frais|utlegg|diett|km.?godtgj)\b",
+    re.IGNORECASE,
+)
+_KEYWORDS_LEDGER = re.compile(
+    r"\b(bilag|voucher|journal|regnskap|bokf[oø]r|kontoplan|konto\s*\d|account\s*\d"
+    r"|bankavstemming|reconcil|avslutt|year.?end|årsavslutning|korrig|feil.*(postering|bilag)"
+    r"|Buchung|asiento|lançamento|écriture)\b",
     re.IGNORECASE,
 )
 
@@ -49,9 +72,10 @@ async def run_agent(
     error_count = 0
     call_count = 0
     # Per-session GET cache: cache_key -> (serialized_result, call_info)
+    # Pre-populated with reference endpoint data so LLM re-fetches hit cache.
     get_cache: dict[str, tuple[str, dict[str, Any]]] = {}
 
-    ref_data = await _prefetch_reference_data(prompt, tripletex, api_log)
+    ref_data = await _prefetch_reference_data(prompt, tripletex, api_log, get_cache)
     call_count += len(ref_data.get("_calls", []))
 
     messages = _build_initial_messages(prompt, extracted_files, llm, ref_data)
@@ -63,8 +87,10 @@ async def run_agent(
 
         remaining = deadline - time.monotonic()
         try:
+            # Keep conversation manageable: system + first user msg + last 30 messages
+            pruned = _prune_messages(messages)
             response: LLMResponse = await asyncio.wait_for(
-                llm.chat(messages, TOOLS),
+                llm.chat(pruned, TOOLS),
                 timeout=max(remaining, 5),
             )
         except asyncio.TimeoutError:
@@ -89,12 +115,16 @@ async def run_agent(
         if time.monotonic() > deadline:
             return _build_summary(prompt, call_count, error_count, start, api_log, "timeout")
 
-        # Execute all tool calls in parallel — independent calls within one LLM
-        # response can safely run concurrently.
+        # Execute all tool calls from this LLM turn in parallel — they are
+        # independent by definition (the LLM chose to issue them together).
         tool_results = await asyncio.gather(*[
             _execute_tool(tc.name, tc.arguments, tripletex, get_cache)
             for tc in response.tool_calls
         ])
+
+        # Check if LLM signalled completion alongside this batch of tool calls.
+        # If so we can exit after appending results, skipping one LLM round-trip.
+        llm_signalled_done = bool(response.text and _DONE_PATTERN.search(response.text))
 
         for tc, (result_str, call_info) in zip(response.tool_calls, tool_results):
             call_count += 1
@@ -105,8 +135,18 @@ async def run_agent(
                 friendly = _format_error_for_llm(call_info)
                 if friendly:
                     result_str = friendly
+                # Don't honour done signal if any call errored
+                llm_signalled_done = False
 
             messages.append(llm.format_tool_result(tc.id, result_str))
+
+        if llm_signalled_done:
+            logger.info(
+                "Early exit: LLM signalled TASK_COMPLETE with final tool calls "
+                "(saved 1 LLM round-trip). %d API calls, %d errors.",
+                call_count, error_count,
+            )
+            return _build_summary(prompt, call_count, error_count, start, api_log, "completed")
 
     elapsed = time.monotonic() - start
     logger.info(
@@ -153,25 +193,39 @@ async def _prefetch_reference_data(
     prompt: str,
     tripletex: TripletexClient,
     api_log: list[dict[str, Any]],
+    get_cache: dict[str, tuple[str, dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """Pre-fetch reference data in parallel based on prompt keywords."""
+    """Pre-fetch reference data in parallel based on prompt keywords.
+
+    Results are also stored in get_cache using path-only keys so that any
+    subsequent LLM calls to the same endpoint (with different params) hit cache.
+    """
     ref_data: dict[str, Any] = {"_calls": []}
     tasks: list[tuple[str, str, dict | None]] = []
 
     needs_vat = bool(_KEYWORDS_VAT.search(prompt))
     needs_payment = bool(_KEYWORDS_PAYMENT.search(prompt))
     needs_travel = bool(_KEYWORDS_TRAVEL.search(prompt))
+    needs_ledger = bool(_KEYWORDS_LEDGER.search(prompt))
 
     if needs_vat:
         tasks.append(("vat_types", "/ledger/vatType", {
-            "count": 100, "fields": "id,number,name,percentage",
+            "count": 50, "fields": "id,number,name,percentage",
             "typeOfVat": "OUTGOING",
         }))
     if needs_payment:
-        tasks.append(("payment_types", "/invoice/paymentType", {"count": 100, "fields": "id,description"}))
+        tasks.append(("payment_types", "/invoice/paymentType", {"count": 50, "fields": "id,description"}))
     if needs_travel:
-        tasks.append(("cost_categories", "/travelExpense/costCategory", {"count": 100, "fields": "id,name,number"}))
-        tasks.append(("travel_payment_types", "/travelExpense/paymentType", {"count": 100, "fields": "id,description"}))
+        tasks.append(("cost_categories", "/travelExpense/costCategory", {"count": 50, "fields": "id,name,number"}))
+        tasks.append(("travel_payment_types", "/travelExpense/paymentType", {"count": 50, "fields": "id,description"}))
+    if needs_ledger:
+        # Pre-fetch common accounts for ledger/reconciliation tasks
+        tasks.append(("bank_accounts", "/ledger/account", {
+            "count": 50,
+            "fields": "id,number,name,isBankAccount",
+            "isBankAccount": True,
+        }))
+        tasks.append(("voucher_types", "/ledger/voucherType", {"count": 30, "fields": "id,name"}))
 
     if not tasks:
         return ref_data
@@ -182,12 +236,30 @@ async def _prefetch_reference_data(
         for key, path, params in tasks
     ])
 
-    for key, values, call_info in results:
+    for (key, path, params), (_, values, call_info) in zip(tasks, results):
         if call_info is not None:
             api_log.append(call_info)
             ref_data["_calls"].append(call_info)
         if values:
             ref_data[key] = values
+            # Pre-populate get_cache with path-only key so LLM re-fetches
+            # with different params still hit cache (not the Tripletex API).
+            if get_cache is not None and path in _REFERENCE_ENDPOINTS:
+                fake_call_info: dict[str, Any] = {
+                    "tool": "tripletex_request",
+                    "method": "GET",
+                    "path": path,
+                    "status_code": 200,
+                    "is_error": False,
+                    "timestamp": time.time(),
+                    "from_prefetch": True,
+                }
+                serialized = json.dumps(
+                    {"status_code": 200, "body": {"values": values}},
+                    ensure_ascii=False, default=str,
+                )
+                # Store with path-only key (reference endpoint normalization)
+                get_cache[path] = (serialized, fake_call_info)
 
     return ref_data
 
@@ -199,7 +271,7 @@ def _format_ref_data_context(ref_data: dict[str, Any]) -> str:
     if "vat_types" in ref_data:
         parts.append("## Pre-fetched OUTGOING VAT Types (from GET /ledger/vatType)")
         parts.append("Use these exact IDs for order lines and products — do NOT guess VAT type IDs.")
-        parts.append("IMPORTANT: For standard 25% Norwegian MVA, pick the one with percentage=25.0")
+        parts.append("For standard 25% Norwegian MVA, use the entry with percentage=25.0")
         common = []
         other = []
         for vt in ref_data["vat_types"]:
@@ -235,6 +307,19 @@ def _format_ref_data_context(ref_data: dict[str, Any]) -> str:
         parts.append("## Pre-fetched Travel Payment Types (from GET /travelExpense/paymentType)")
         for tp in ref_data["travel_payment_types"][:20]:
             parts.append(f"  - id={tp.get('id')}, description=\"{tp.get('description')}\"")
+        parts.append("")
+
+    if "bank_accounts" in ref_data:
+        parts.append("## Pre-fetched Bank Accounts (from GET /ledger/account?isBankAccount=true)")
+        parts.append("Use these account IDs for bank-side entries in vouchers.")
+        for acc in ref_data["bank_accounts"][:10]:
+            parts.append(f"  - id={acc.get('id')}, number={acc.get('number')}, name=\"{acc.get('name')}\"")
+        parts.append("")
+
+    if "voucher_types" in ref_data:
+        parts.append("## Pre-fetched Voucher Types (from GET /ledger/voucherType)")
+        for vt in ref_data["voucher_types"][:10]:
+            parts.append(f"  - id={vt.get('id')}, name=\"{vt.get('name')}\"")
         parts.append("")
 
     return "\n".join(parts)
@@ -335,22 +420,29 @@ async def _execute_tool(
     call_info["method"] = method
     call_info["path"] = path
 
-    # Return cached GET responses to avoid duplicate lookups
+    # Return cached GET responses to avoid duplicate lookups.
+    # For known reference endpoints, use path-only key so any param variant hits cache.
     if method == "GET" and get_cache is not None:
-        cache_key = f"{path}?{json.dumps(params or {}, sort_keys=True)}"
+        if path in _REFERENCE_ENDPOINTS:
+            cache_key = path  # normalize — ignore params for reference endpoints
+        else:
+            cache_key = f"{path}?{json.dumps(params or {}, sort_keys=True)}"
         if cache_key in get_cache:
-            logger.info("Cache hit for GET %s", path)
+            logger.info("Cache hit for GET %s (key=%s)", path, cache_key)
             cached_str, cached_info = get_cache[cache_key]
-            # Return a copy with updated timestamp
             return cached_str, {**cached_info, "timestamp": time.time(), "from_cache": True}
 
     try:
         resp = await tripletex.request(method, path, params=params, json_body=json_body)
 
-        # Retry once on rate limit
+        # Retry on rate limit or transient server errors (competition servers can be flaky)
         if resp.status_code == 429:
             logger.warning("Rate limited on %s %s, retrying after 3s", method, path)
             await asyncio.sleep(3)
+            resp = await tripletex.request(method, path, params=params, json_body=json_body)
+        elif resp.status_code >= 500:
+            logger.warning("Server error %d on %s %s, retrying after 2s", resp.status_code, method, path)
+            await asyncio.sleep(2)
             resp = await tripletex.request(method, path, params=params, json_body=json_body)
 
     except Exception as exc:
@@ -359,7 +451,6 @@ async def _execute_tool(
         return error_result, call_info
 
     call_info["status_code"] = resp.status_code
-    # Treat both 4xx and 5xx as errors
     call_info["is_error"] = not resp.ok
 
     if call_info["is_error"]:
@@ -371,7 +462,10 @@ async def _execute_tool(
 
     # Cache successful GET responses for the session
     if method == "GET" and resp.ok and get_cache is not None:
-        cache_key = f"{path}?{json.dumps(params or {}, sort_keys=True)}"
+        if path in _REFERENCE_ENDPOINTS:
+            cache_key = path
+        else:
+            cache_key = f"{path}?{json.dumps(params or {}, sort_keys=True)}"
         get_cache[cache_key] = (serialized, dict(call_info))
 
     return serialized, call_info
@@ -381,7 +475,6 @@ def _smart_serialize(result: dict[str, Any], max_len: int = 12000) -> str:
     """Serialize a result, truncating large list responses intelligently."""
     body = result.get("body", {})
 
-    # For large list responses: trim the values array progressively
     if isinstance(body, dict) and "values" in body:
         values = body.get("values", [])
         if len(values) > 0:
@@ -405,8 +498,17 @@ def _smart_serialize(result: dict[str, Any], max_len: int = 12000) -> str:
     return serialized
 
 
+def _prune_messages(messages: list[dict[str, Any]], max_tail: int = 20) -> list[dict[str, Any]]:
+    """Keep system message + first user message + last N messages to reduce token usage."""
+    if len(messages) <= max_tail + 2:
+        return messages
+    # Always keep: system (index 0) and first user message (index 1)
+    head = messages[:2]
+    tail = messages[-(max_tail):]
+    return head + tail
+
+
 def _classify_error(status_code: int, body: Any) -> str:
-    """Classify a Tripletex error into a category for logging."""
     if status_code == 401:
         return "auth_error"
     if status_code == 404:
@@ -428,7 +530,6 @@ def _classify_error(status_code: int, body: Any) -> str:
 
 
 def _extract_validation_messages(body: Any) -> list[dict[str, str]]:
-    """Pull out the validationMessages array from a Tripletex error response."""
     if not isinstance(body, dict):
         return []
     msgs = body.get("validationMessages")
@@ -456,6 +557,12 @@ _ERROR_RECOVERY_HINTS: dict[str, dict[str, str]] = {
         "amount": "amount is required for voucher postings and must be a number.",
         "account": "account is required for voucher postings. Look up via GET /ledger/account.",
         "postings": "Voucher postings must balance (sum of amounts = 0).",
+        "version": "Include id and version from the GET response when doing PUT updates.",
+        "date": "date is required. Use YYYY-MM-DD format.",
+        "amountCurrencyIncVat": "amountCurrencyIncVat is required for travel cost lines.",
+        "travelExpense": "travelExpense reference is required. Use {id: expenseId}.",
+        "costCategory": "costCategory is required. Use pre-fetched cost category IDs.",
+        "paymentType": "paymentType is required. Use pre-fetched travel payment type IDs.",
     },
     "not_found": {
         ":grantEntitlementsByTemplate": (
@@ -467,6 +574,7 @@ _ERROR_RECOVERY_HINTS: dict[str, dict[str, str]] = {
         ":createCreditNote": "Use QUERY params: date (YYYY-MM-DD). No body needed.",
         ":invoice": "Use PUT /order/{orderId}/:invoice with query param invoiceDate.",
         ":deliver": "Use PUT /travelExpense/:deliver with query param id={expenseId}.",
+        ":approve": "Use PUT /travelExpense/:approve with query param id={expenseId}.",
     },
 }
 
@@ -512,12 +620,12 @@ def _format_error_for_llm(call_info: dict[str, Any]) -> str | None:
     if error_type == "auth_error":
         hints.append("Authentication failed — credentials may be invalid.")
     elif error_type == "rate_limited":
-        hints.append("Rate limited — a retry was already attempted. Wait before trying again.")
+        hints.append("Rate limited — a retry was already attempted. Wait briefly before trying again.")
     elif error_type == "conflict":
         hints.append("Conflict — the entity may already exist or version mismatch. "
-                      "Include id and version from the previous response for PUT updates.")
+                      "Fetch the entity first (GET) to get the current id and version for PUT updates.")
     elif error_type and error_type.startswith("server_error"):
-        hints.append("Server error — try the request again. If it persists, skip and continue.")
+        hints.append("Server error — retry the request once. If it persists, skip and continue.")
 
     if hints:
         combined = " ".join(hints)
