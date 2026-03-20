@@ -28,17 +28,28 @@ def extract_annotation_crops():
     img_info = {img["id"]: img for img in coco["images"]}
     img_cache = {}
 
+    print(f"  Annotations: {len(coco['annotations'])}, Images dir: {img_dir}")
+    if not img_dir.exists():
+        print(f"  ERROR: Image directory does not exist: {img_dir}")
+        return
+    available = len(list(img_dir.iterdir()))
+    print(f"  Available images on disk: {available}")
+
     count = 0
+    skipped_existing = 0
+    skipped_missing = 0
     for ann in coco["annotations"]:
         cat_id = ann["category_id"]
         out_dir = CROPS_DIR / str(cat_id)
         out_path = out_dir / f"crop_{ann['id']}.jpg"
         if out_path.exists():
+            skipped_existing += 1
             continue
 
         info = img_info[ann["image_id"]]
         src = img_dir / info["file_name"]
         if not src.exists():
+            skipped_missing += 1
             continue
 
         # Cache opened images to avoid re-reading
@@ -55,6 +66,10 @@ def extract_annotation_crops():
         crop.save(out_path, quality=95)
         count += 1
 
+    if skipped_existing:
+        print(f"  Skipped {skipped_existing} crops (already exist)")
+    if skipped_missing:
+        print(f"  WARNING: Skipped {skipped_missing} annotations (source image not found)")
     print(f"Extracted {count} annotation crops to {CROPS_DIR}")
 
 

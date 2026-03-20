@@ -3,7 +3,7 @@ Submission entry point for the NM i AI Object Detection task.
 
 Two-stage pipeline:
   Stage 1: ONNX detector (nc=1) finds all product bounding boxes.
-  Stage 2: MobileNetV3 embeds each crop, classifies by cosine similarity
+  Stage 2: ResNet50 embeds each crop, classifies by cosine similarity
            to pre-computed reference embeddings.
 
 The sandbox executes:
@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
-from torchvision.models import mobilenet_v3_small
+from torchvision.models import resnet50
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DETECT_IMGSZ = 640
@@ -108,8 +108,8 @@ def load_models():
     )
 
     # Stage 2 — embedder + reference gallery
-    embedder = mobilenet_v3_small(weights=None)
-    embedder.classifier = torch.nn.Identity()
+    embedder = resnet50(weights=None)
+    embedder.fc = torch.nn.Identity()
     state = torch.load(
         str(SCRIPT_DIR / "classifier.pt"), map_location=device, weights_only=True
     )

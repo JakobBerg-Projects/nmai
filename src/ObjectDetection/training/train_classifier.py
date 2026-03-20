@@ -1,11 +1,11 @@
-"""Train a MobileNetV3 embedding model for crop → product classification.
+"""Train a ResNet50 embedding model for crop → product classification.
 
 Uses crops extracted by extract_crops.py (annotation crops + reference images).
-Fine-tunes MobileNetV3-Small with classification loss, then saves the backbone
+Fine-tunes ResNet50 with classification loss, then saves the backbone
 as a feature extractor and pre-computes reference embeddings.
 
 Usage:
-    python -m training.train_classifier --epochs 30 --batch-size 64
+    python -m training.train_classifier --epochs 100 --batch-size 64
 """
 import argparse
 import json
@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,12 +74,12 @@ class CropDataset(Dataset):
 
 
 class EmbeddingClassifier(nn.Module):
-    """MobileNetV3-Small backbone + classification head."""
-    def __init__(self, num_classes: int, embed_dim: int = 576):
+    """ResNet50 backbone + classification head."""
+    def __init__(self, num_classes: int, embed_dim: int = 2048):
         super().__init__()
-        backbone = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
-        # Remove the original classifier
-        backbone.classifier = nn.Identity()
+        backbone = resnet50(weights=ResNet50_Weights.DEFAULT)
+        # Remove the original fc layer to get 2048-dim embeddings
+        backbone.fc = nn.Identity()
         self.backbone = backbone
         self.embed_dim = embed_dim
         self.head = nn.Linear(embed_dim, num_classes)

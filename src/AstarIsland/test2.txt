@@ -1,0 +1,2 @@
+python solve.py --learn
+python solve.py

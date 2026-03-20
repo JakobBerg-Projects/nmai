@@ -15,13 +15,13 @@ import torch.nn.functional as F
 from pathlib import Path
 from PIL import Image
 from torchvision import transforms
-from torchvision.models import mobilenet_v3_small
+from torchvision.models import resnet50
 import onnxruntime as ort
 from strategies.base import Strategy
 
 
 CROP_SIZE = 224
-EMBED_DIM = 576  # MobileNetV3-Small final feature dim
+EMBED_DIM = 2048  # ResNet50 final feature dim
 
 DETECT_IMGSZ = 640  # must match the ONNX export size
 
@@ -97,10 +97,10 @@ def _nms(boxes, scores, iou_thresh=0.5):
 
 
 def _build_embedder(weights_path: Path, device: str):
-    """Load MobileNetV3-Small as a feature extractor."""
-    model = mobilenet_v3_small(weights=None)
-    # Replace classifier head with identity to get embeddings
-    model.classifier = torch.nn.Identity()
+    """Load ResNet50 as a feature extractor."""
+    model = resnet50(weights=None)
+    # Remove fc layer to get 2048-dim embeddings
+    model.fc = torch.nn.Identity()
     state = torch.load(str(weights_path), map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.to(device).eval()
