@@ -16,6 +16,7 @@ MODEL="yolov8x.pt"
 EPOCHS=100
 IMGSZ=640
 STRATEGY="detector"
+BATCH=16
 CLS_EPOCHS=30
 DELETE_ONLY=false
 
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --epochs)     EPOCHS="$2"; shift 2 ;;
     --imgsz)      IMGSZ="$2"; shift 2 ;;
     --strategy)   STRATEGY="$2"; shift 2 ;;
+    --batch)      BATCH="$2"; shift 2 ;;
     --cls-epochs) CLS_EPOCHS="$2"; shift 2 ;;
     --zone)       ZONE="$2"; shift 2 ;;
     --delete)     DELETE_ONLY=true; shift ;;
@@ -78,7 +80,7 @@ echo "  GCP Remote Training"
 echo "  Strategy: $STRATEGY"
 echo "  GPU:      $GPU_TYPE ($ACCELERATOR)"
 echo "  Model:    $MODEL"
-echo "  Epochs:   $EPOCHS  |  ImgSz: $IMGSZ"
+echo "  Epochs:   $EPOCHS  |  ImgSz: $IMGSZ  |  Batch: $BATCH"
 echo "  Zone:     $ZONE"
 echo "══════════════════════════════════════════════════════════"
 
@@ -181,8 +183,10 @@ gcloud compute ssh "$VM_NAME" --zone="$ZONE" -- bash -lc "
   # Install system dependency for OpenCV
   sudo apt-get update -qq && sudo apt-get install -y -qq libgl1-mesa-glx libglib2.0-0
 
-  # Install requirements (use VM's pre-installed torch, don't override)
-  pip install -q 'ultralytics>=8.3.0' opencv-python-headless pillow
+  # Use torch 2.5.1 for training (ultralytics 8.1.0 incompatible with torch 2.6 weights_only default)
+  # Weights are exported to ONNX, so torch version mismatch with sandbox (2.6.0) is not an issue
+  pip install -q torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+  pip install -q ultralytics==8.1.0 opencv-python-headless pillow onnxruntime
 
   # Verify GPU
   python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"WARNING: No GPU!\")'
@@ -190,11 +194,11 @@ gcloud compute ssh "$VM_NAME" --zone="$ZONE" -- bash -lc "
   case '$STRATEGY' in
     detector)
       echo '=== Training single-class detector ==='
-      python3 -m training.train_detector --mode single --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ
+      python3 -m training.train_detector --mode single --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ --batch $BATCH
       ;;
     multiclass)
       echo '=== Training multiclass detector ==='
-      python3 -m training.train_detector --mode multi --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ
+      python3 -m training.train_detector --mode multi --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ --batch $BATCH
       ;;
     classifier)
       echo '=== Extracting crops ==='
@@ -204,7 +208,7 @@ gcloud compute ssh "$VM_NAME" --zone="$ZONE" -- bash -lc "
       ;;
     two_stage)
       echo '=== Phase 1: Training single-class detector ==='
-      python3 -m training.train_detector --mode single --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ
+      python3 -m training.train_detector --mode single --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ --batch $BATCH
       echo '=== Phase 2: Extracting crops ==='
       python3 -m training.extract_crops
       echo '=== Phase 3: Training classifier ==='
@@ -226,13 +230,13 @@ mkdir -p "$SCRIPT_DIR/weights"
 case "$STRATEGY" in
   detector)
     gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/detector.pt" \
-      "$SCRIPT_DIR/weights/detector.pt" --zone="$ZONE"
+      "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
+      "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
     ;;
   multiclass)
     gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/best.pt" \
-      "$SCRIPT_DIR/weights/best.pt" --zone="$ZONE"
+      "$VM_NAME:${REMOTE_DIR}/weights/best.onnx" \
+      "$SCRIPT_DIR/weights/best.onnx" --zone="$ZONE"
     ;;
   classifier)
     gcloud compute scp \
@@ -244,8 +248,8 @@ case "$STRATEGY" in
     ;;
   two_stage)
     gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/detector.pt" \
-      "$SCRIPT_DIR/weights/detector.pt" --zone="$ZONE"
+      "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
+      "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
     gcloud compute scp \
       "$VM_NAME:${REMOTE_DIR}/weights/classifier.pt" \
       "$SCRIPT_DIR/weights/classifier.pt" --zone="$ZONE"

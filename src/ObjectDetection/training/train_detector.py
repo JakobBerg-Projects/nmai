@@ -62,7 +62,7 @@ def prepare_multiclass():
     return yaml_path
 
 
-def train(mode: str, model_name: str, epochs: int, imgsz: int):
+def train(mode: str, model_name: str, epochs: int, imgsz: int, batch: int = 16):
     WEIGHTS_DIR.mkdir(exist_ok=True)
 
     if mode == "single":
@@ -77,12 +77,13 @@ def train(mode: str, model_name: str, epochs: int, imgsz: int):
         data=str(data_yaml),
         epochs=epochs,
         imgsz=imgsz,
+        batch=batch,
         project=str(ROOT / "runs"),
         name=out_name,
         exist_ok=True,
     )
 
-    # Copy best weights to weights/ for run.py
+    # Copy best weights to weights/
     best_src = ROOT / "runs" / out_name / "weights" / "best.pt"
     if mode == "single":
         dst = WEIGHTS_DIR / "detector.pt"
@@ -90,6 +91,16 @@ def train(mode: str, model_name: str, epochs: int, imgsz: int):
         dst = WEIGHTS_DIR / "best.pt"
     shutil.copy2(best_src, dst)
     print(f"\nSaved weights to {dst}")
+
+    # Export to ONNX (pickle-free, compatible with any torch version)
+    best_model = YOLO(str(dst))
+    onnx_name = dst.stem + ".onnx"
+    best_model.export(format="onnx", imgsz=imgsz, opset=17)
+    onnx_src = dst.with_suffix(".onnx")
+    onnx_dst = WEIGHTS_DIR / onnx_name
+    if onnx_src != onnx_dst:
+        shutil.move(str(onnx_src), str(onnx_dst))
+    print(f"Exported ONNX to {onnx_dst}")
 
 
 if __name__ == "__main__":
@@ -99,6 +110,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="yolov8x.pt", help="YOLO model variant")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--batch", type=int, default=16)
     args = parser.parse_args()
 
-    train(mode=args.mode, model_name=args.model, epochs=args.epochs, imgsz=args.imgsz)
+    train(mode=args.mode, model_name=args.model, epochs=args.epochs, imgsz=args.imgsz, batch=args.batch)

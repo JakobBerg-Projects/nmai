@@ -13,7 +13,7 @@ class YoloMulticlass(Strategy):
         self.model = None
 
     def load(self):
-        self.model = YOLO(str(self.weights_dir / "best.pt"))
+        self.model = YOLO(str(self.weights_dir / "best.onnx"))
 
     def predict(self, img_path: str, device: str = "cpu") -> list[dict]:
         with torch.no_grad():

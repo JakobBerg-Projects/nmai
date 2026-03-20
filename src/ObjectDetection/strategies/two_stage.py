@@ -23,7 +23,7 @@ from strategies.base import Strategy
 CROP_SIZE = 224
 EMBED_DIM = 576  # MobileNetV3-Small final feature dim
 
-DETECT_IMGSZ = 1280  # must match the export size
+DETECT_IMGSZ = 640  # must match the ONNX export size
 
 CROP_TRANSFORM = transforms.Compose([
     transforms.Resize((CROP_SIZE, CROP_SIZE)),
@@ -101,7 +101,7 @@ def _build_embedder(weights_path: Path, device: str):
     model = mobilenet_v3_small(weights=None)
     # Replace classifier head with identity to get embeddings
     model.classifier = torch.nn.Identity()
-    state = torch.load(str(weights_path), map_location=device)
+    state = torch.load(str(weights_path), map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.to(device).eval()
     return model
@@ -134,6 +134,7 @@ class TwoStage(Strategy):
         refs = torch.load(
             str(self.weights_dir / "ref_embeddings.pt"),
             map_location=self.device,
+            weights_only=True,
         )
         self.ref_cat_ids = list(refs.keys())
         self.ref_embeds = torch.stack([refs[cid] for cid in self.ref_cat_ids])

@@ -17,7 +17,7 @@ class DetectionOnly(Strategy):
         self.model = None
 
     def load(self):
-        self.model = YOLO(str(self.weights_dir / "detector.pt"))
+        self.model = YOLO(str(self.weights_dir / "detector.onnx"))
 
     def predict(self, img_path: str, device: str = "cpu") -> list[dict]:
         with torch.no_grad():
