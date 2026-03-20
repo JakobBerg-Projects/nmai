@@ -638,7 +638,7 @@ def main():
     seeds_count = detail["seeds_count"]
     initial_states = detail["initial_states"]
 
-    seed_idx = st.sidebar.selectbox("Seed", list(range(seeds_count)), format_func=lambda i: f"Seed {i}")
+    seed_idx = st.sidebar.selectbox("Seed", list(range(seeds_count)), format_func=lambda i: f"Seed {i + 1}")
 
     initial_state = initial_states[seed_idx]
     grid = np.array(initial_state["grid"])
@@ -655,7 +655,7 @@ def main():
         st.sidebar.markdown(f"**Rank:** {selected_round.get('rank', '?')}/{selected_round.get('total_teams', '?')}")
     if selected_round.get("seed_scores"):
         scores = selected_round["seed_scores"]
-        st.sidebar.markdown(f"**Seed {seed_idx} score:** {scores[seed_idx]:.2f}" if seed_idx < len(scores) and scores[seed_idx] is not None else "")
+        st.sidebar.markdown(f"**Seed {seed_idx + 1} score:** {scores[seed_idx]:.2f}" if seed_idx < len(scores) and scores[seed_idx] is not None else "")
 
     # Budget
     try:
@@ -680,11 +680,11 @@ def main():
 
     # === TAB 1: Initial Map ===
     with tabs[0]:
-        st.subheader(f"Initial Terrain — Seed {seed_idx}")
+        st.subheader(f"Initial Terrain — Seed {seed_idx + 1}")
 
         col1, col2 = st.columns(2)
         with col1:
-            fig_terrain = make_terrain_heatmap(grid, title=f"Terrain Grid (Seed {seed_idx})")
+            fig_terrain = make_terrain_heatmap(grid, title=f"Terrain Grid (Seed {seed_idx + 1})")
             st.plotly_chart(fig_terrain, use_container_width=True)
 
         with col2:
@@ -721,7 +721,7 @@ def main():
 
     # === TAB 2: Cached Observations ===
     with tabs[1]:
-        st.subheader(f"Cached Observations — Seed {seed_idx}")
+        st.subheader(f"Cached Observations — Seed {seed_idx + 1}")
 
         cached = load_cached_observations(round_id, seed_idx, map_h, map_w)
         if cached is None:
@@ -807,7 +807,7 @@ def main():
 
     # === TAB 3: Predictions ===
     with tabs[2]:
-        st.subheader(f"Predictions — Seed {seed_idx}")
+        st.subheader(f"Predictions — Seed {seed_idx + 1}")
 
         try:
             predictions = fetch_my_predictions(token, round_id)
@@ -870,7 +870,7 @@ def main():
 
     # === TAB 4: Ground Truth & Analysis ===
     with tabs[3]:
-        st.subheader(f"Ground Truth & Analysis — Seed {seed_idx}")
+        st.subheader(f"Ground Truth & Analysis — Seed {seed_idx + 1}")
 
         if selected_round["status"] not in ("completed", "scoring"):
             st.info("Ground truth is only available after the round is completed.")
@@ -978,7 +978,7 @@ def main():
 
     # === TAB 5: Per-Class Probabilities ===
     with tabs[4]:
-        st.subheader(f"Per-Class Probability Maps — Seed {seed_idx}")
+        st.subheader(f"Per-Class Probability Maps — Seed {seed_idx + 1}")
 
         # Try to get prediction or ground truth probabilities
         source = st.radio("Source", ["Prediction", "Ground Truth"], horizontal=True, key="prob_source")
@@ -1086,9 +1086,9 @@ def main():
         for i, s in enumerate(scores):
             if s is not None:
                 emoji = "🟢" if s >= 70 else "🟡" if s >= 50 else "🔴"
-                st.sidebar.markdown(f"{emoji} Seed {i}: **{s:.2f}**")
+                st.sidebar.markdown(f"{emoji} Seed {i + 1}: **{s:.2f}**")
             else:
-                st.sidebar.markdown(f"⚪ Seed {i}: *not scored*")
+                st.sidebar.markdown(f"⚪ Seed {i + 1}: *not scored*")
 
 
 if __name__ == "__main__":

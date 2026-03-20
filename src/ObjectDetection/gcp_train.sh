@@ -62,8 +62,12 @@ case "$GPU_TYPE" in
     ACCELERATOR="type=nvidia-h100-80gb,count=1"
     MACHINE_TYPE="a3-highgpu-1g"
     ;;
+  b200)
+    ACCELERATOR="type=nvidia-b200,count=1"
+    MACHINE_TYPE="a4-highgpu-1g"
+    ;;
   *)
-    echo "Unsupported GPU: $GPU_TYPE (use t4, l4, a100, a100-80, h100)"
+    echo "Unsupported GPU: $GPU_TYPE (use t4, l4, a100, a100-80, h100, b200)"
     exit 1
     ;;
 esac
@@ -190,6 +194,8 @@ gcloud compute ssh "$VM_NAME" --zone="$ZONE" -- bash -lc "
 
   # Verify GPU
   python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"WARNING: No GPU!\")'
+
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
   case '$STRATEGY' in
     detector)

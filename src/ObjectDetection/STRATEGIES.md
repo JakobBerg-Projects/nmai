@@ -225,3 +225,15 @@
 - [ ] No disallowed imports (`os`, `subprocess`, `socket`, etc.)
 - [ ] Tested locally before submitting
 - [ ] Pin `ultralytics==8.1.0` if using YOLO `.pt` weights
+
+./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 300 --imgsz 1280 --batch 4 --cls-epochs 100 --gpu t4 --zone europe-west4-a
+Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
+     87/300      14.6G      1.024      0.464      1.232        253       1280: 100%|██████████| 50/50 [01:05<00:00,  1.31s/it]
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 7/7 [00:05<00:00,  1.40it/s]
+                   all         50       4807      0.923      0.919      0.951      0.648
+
+Run around 90 epochs for detection.
+
+
+
+./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 300 --imgsz 1280 --batch 6 --cls-epochs 100 --gpu l4 --zone europe-west1-b
