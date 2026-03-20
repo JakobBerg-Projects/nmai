@@ -48,7 +48,11 @@ class LLMClient:
 
     def _init_anthropic(self) -> None:
         from anthropic import AsyncAnthropic
-        self._anthropic = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        self._anthropic = AsyncAnthropic(
+            api_key=ANTHROPIC_API_KEY,
+            max_retries=2,
+            timeout=60.0,
+        )
         self._model = ANTHROPIC_MODEL
 
     async def chat(
@@ -111,7 +115,7 @@ class LLMClient:
 
         kwargs: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": 8192,
+            "max_tokens": 4096,
             "temperature": 0,
             "messages": conversation,
         }
