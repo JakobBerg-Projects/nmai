@@ -35,6 +35,13 @@ CRITICAL RULES:
 - Numbers and amounts: use them exactly as specified. "kr 500" = 500, "kr 1.500" = 1500 (Norwegian format).
 - Norwegian number format: 1.000 = one thousand (period as thousands separator), 1,5 = 1.5 (comma as decimal).
 - When creating entities, include ALL specified fields from the task. Missing fields lose points.
+
+KNOWN API RESTRICTIONS (avoid 422 errors):
+- Product: use "priceExcludingVatCurrency" (NOT "unitCostPrice", "costPrice", or "unitPrice").
+- Invoice search fields: id,invoiceNumber,amount,amountOutstanding,customer (NOT "description" or "orders").
+- Supplier invoice: ONLY send invoiceNumber, invoiceDate, supplier. No other fields.
+- vatType: always use {"number":"3"} format, NOT {"id":3}.
+- orderLines: use unitPriceExcludingVatCurrency (NOT unitPriceExcludingVat).
 """
 
 SECTIONS: dict[str, str] = {
@@ -87,18 +94,21 @@ SUPPLIER INVOICE TIPS:
 - Create supplier first if needed: POST /supplier {"name":"...", "isSupplier":true}
 - Then create supplier invoice via tripletex_api:
   POST /supplierInvoice {"invoiceNumber":"...", "invoiceDate":"YYYY-MM-DD", "supplier":{"id":N}}
-- Do NOT include voucher, dueDate, currency, or amountNOK fields — these cause 422 errors.
-- If you get 500 error: retry ONE time, then STOP. The supplier creation alone earns partial credit.
+- ONLY these fields are allowed: invoiceNumber, invoiceDate, supplier. NOTHING ELSE.
+- Do NOT include: voucher, dueDate, currency, amountNOK, amountExcludingVat, amountIncludingVat — ALL cause 422 errors.
+- If you get 500 error: retry ONE time with the same minimal body, then STOP.
+- The supplier creation alone earns partial credit — don't waste time retrying supplier invoice.
 - "leverandørfaktura" = supplier invoice. "fakturanummer" = invoiceNumber. "fakturadato" = invoiceDate.
 """,
 
     "product": """\
 PRODUCT TIPS:
-- Via tripletex_api: POST /product {"name":"...", "number":"...", "priceExcludingVatCurrency":N}
+- Via tripletex_api: POST /product {"name":"...", "number":"...", "priceExcludingVatCurrency":N, "vatType":{"number":"3"}}
+- IMPORTANT: use "priceExcludingVatCurrency" for price. Do NOT use "unitCostPrice" or "costPrice" — those fields DON'T EXIST and cause 422.
+- For cost price, use "costExcludingVatCurrency".
 - If "Produktnummeret X er i bruk": GET /product?number=X → use existing product ID.
-- vatType from pre-fetched data, e.g. {"number": "3"} for 25% MVA.
-- "produkt" = product. "produktnummer" = number. "pris" = price.
-- "varenummer" = product number.
+- vatType: ALWAYS use {"number":"3"} for 25% MVA. Do NOT use {"id":3}.
+- "produkt" = product. "produktnummer" = number. "pris" = price. "varenummer" = product number.
 """,
 
     "order": """\
@@ -121,7 +131,9 @@ INVOICE TIPS:
 - If using tripletex_api for manual invoicing:
   * POST /invoice body does NOT support sendToCustomer — omit it.
   * PUT /order/{id}/:invoice uses sendToCustomer as a QUERY PARAM, not body.
-- "bankkontonummer" error → skip invoicing, the customer + order still earn partial credit.
+- "bankkontonummer" error → STOP trying to invoice. The customer + order still earn partial credit.
+- When searching invoices: GET /invoice?invoiceDateFrom=...&invoiceDateTo=...&fields=id,invoiceNumber,amount,amountOutstanding,customer
+  Do NOT include "description" or "orders" in fields — they cause 400 errors.
 - "forfallsdato" = due date. "fakturadato" = invoice date.
 - "antall" / "stk" / "stykk" = count/quantity. "enhetspris" / "pris" = unit price.
 """,
@@ -133,7 +145,10 @@ PAYMENT TIPS:
 - Customer payments use INCOMING types from /invoice/paymentType (use "Betalt til bank").
 - Do NOT use /ledger/paymentTypeOut for customer payments! Those are for outgoing payments.
 - paidAmount should match amountOutstanding (the amount with VAT).
+- To find invoices: GET /invoice?invoiceDateFrom=2026-01-01&invoiceDateTo=2026-12-31&fields=id,invoiceNumber,amount,amountOutstanding,customer&count=100
+  Do NOT include "description" in invoice fields — it causes 400 error.
 - "innbetaling" / "betaling" = payment. "betalt" = paid.
+- "returned payment" / "tilbakeført betaling" = the customer's payment was returned, so you need to reverse it or handle it.
 """,
 
     "credit_note": """\
