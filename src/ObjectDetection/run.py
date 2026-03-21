@@ -3,7 +3,7 @@ Submission entry point for the NM i AI Object Detection task.
 
 Two-stage pipeline:
   Stage 1: ONNX detector (nc=1) finds all product bounding boxes.
-  Stage 2: ResNet50 embeds each crop, classifies by cosine similarity
+  Stage 2: Embedding model classifies each crop by cosine similarity
            to pre-computed reference embeddings.
 
 The sandbox executes:
@@ -16,21 +16,59 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
-from torchvision.models import resnet50
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DETECT_IMGSZ = 640
-CROP_SIZE = 224
+DETECT_IMGSZ = 1280
 
-CROP_TRANSFORM = transforms.Compose([
-    transforms.Resize((CROP_SIZE, CROP_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+
+# ── Config ────────────────────────────────────────────────────────────
+
+def load_config():
+    """Load model config, with fallback defaults for backward compatibility."""
+    config_path = SCRIPT_DIR / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            return json.load(f)
+    return {"arch": "resnet50", "crop_size": 224, "embed_dim": 2048}
+
+
+def build_backbone(arch):
+    """Build backbone model for inference (no pretrained weights)."""
+    if arch == 'resnet50':
+        from torchvision.models import resnet50
+        model = resnet50(weights=None)
+        model.fc = nn.Identity()
+        return model
+    elif arch == 'efficientnet_v2_s':
+        from torchvision.models import efficientnet_v2_s
+        model = efficientnet_v2_s(weights=None)
+        model.classifier = nn.Identity()
+        return model
+    elif arch == 'convnext_tiny':
+        from torchvision.models import convnext_tiny
+        model = convnext_tiny(weights=None)
+        model.classifier[2] = nn.Identity()
+        return model
+    elif arch == 'convnext_small':
+        from torchvision.models import convnext_small
+        model = convnext_small(weights=None)
+        model.classifier[2] = nn.Identity()
+        return model
+    else:
+        raise ValueError(f"Unknown architecture: {arch}")
+
+
+def get_crop_transform(crop_size):
+    return transforms.Compose([
+        transforms.Resize((crop_size, crop_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
 
 
 # ── ONNX detector helpers ───────────────────────────────────────────
@@ -99,6 +137,10 @@ def detect_onnx(session, img, conf_thresh=0.25):
 
 def load_models():
     """Load detector and classifier models."""
+    config = load_config()
+    arch = config['arch']
+    crop_size = config['crop_size']
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Stage 1 — ONNX detector (no pickle, no ultralytics dependency)
@@ -108,8 +150,7 @@ def load_models():
     )
 
     # Stage 2 — embedder + reference gallery
-    embedder = resnet50(weights=None)
-    embedder.fc = torch.nn.Identity()
+    embedder = build_backbone(arch)
     state = torch.load(
         str(SCRIPT_DIR / "classifier.pt"), map_location=device, weights_only=True
     )
@@ -122,12 +163,16 @@ def load_models():
     ref_cat_ids = list(refs.keys())
     ref_embeds = F.normalize(torch.stack([refs[c] for c in ref_cat_ids]), dim=1)
 
-    return detector, embedder, ref_embeds, ref_cat_ids, device
+    crop_transform = get_crop_transform(crop_size)
+
+    print(f"Config: arch={arch}, crop_size={crop_size}")
+    return detector, embedder, ref_embeds, ref_cat_ids, device, crop_transform
 
 
 # ── Inference ────────────────────────────────────────────────────────
 
-def predict_image(img_path, detector, embedder, ref_embeds, ref_cat_ids, device):
+def predict_image(img_path, detector, embedder, ref_embeds, ref_cat_ids,
+                  device, crop_transform):
     """Run two-stage inference on a single image."""
     img = Image.open(img_path).convert("RGB")
     detections = detect_onnx(detector, img)
@@ -139,7 +184,7 @@ def predict_image(img_path, detector, embedder, ref_embeds, ref_cat_ids, device)
             continue
 
         # Classify crop via embedding similarity
-        tensor = CROP_TRANSFORM(crop).unsqueeze(0).to(device)
+        tensor = crop_transform(crop).unsqueeze(0).to(device)
         with torch.no_grad():
             emb = F.normalize(embedder(tensor), dim=1)
         sims = (emb @ ref_embeds.T).squeeze(0)
@@ -162,7 +207,7 @@ def main():
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
-    detector, embedder, ref_embeds, ref_cat_ids, device = load_models()
+    detector, embedder, ref_embeds, ref_cat_ids, device, crop_transform = load_models()
     print(f"Models loaded on {device}")
 
     predictions = []
@@ -173,7 +218,8 @@ def main():
 
         image_id = int(img_path.stem.split("_")[-1])
         preds = predict_image(
-            str(img_path), detector, embedder, ref_embeds, ref_cat_ids, device
+            str(img_path), detector, embedder, ref_embeds, ref_cat_ids,
+            device, crop_transform
         )
         for p in preds:
             p["image_id"] = image_id

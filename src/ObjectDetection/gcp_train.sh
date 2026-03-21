@@ -17,11 +17,16 @@ EPOCHS=100
 IMGSZ=640
 STRATEGY="detector"
 BATCH=16
+CLS_BATCH=64
 CLS_EPOCHS=30
+CLS_ARCH="resnet50"
+CLS_CROP_SIZE=""
+PATIENCE=10
+FP16=false
 DELETE_ONLY=false
 
 ZONE="europe-west1-b"
-VM_NAME="yolo-training"
+VM_NAME="${VM_NAME:-yolo-training}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ── Parse args ──────────────────────────────────────────────────────
@@ -34,6 +39,12 @@ while [[ $# -gt 0 ]]; do
     --strategy)   STRATEGY="$2"; shift 2 ;;
     --batch)      BATCH="$2"; shift 2 ;;
     --cls-epochs) CLS_EPOCHS="$2"; shift 2 ;;
+    --cls-batch)  CLS_BATCH="$2"; shift 2 ;;
+    --patience)   PATIENCE="$2"; shift 2 ;;
+    --cls-arch)   CLS_ARCH="$2"; shift 2 ;;
+    --cls-crop-size) CLS_CROP_SIZE="$2"; shift 2 ;;
+    --fp16)       FP16=true; shift ;;
+    --vm-name)    VM_NAME="$2"; shift 2 ;;
     --zone)       ZONE="$2"; shift 2 ;;
     --delete)     DELETE_ONLY=true; shift ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
@@ -85,6 +96,7 @@ echo "  Strategy: $STRATEGY"
 echo "  GPU:      $GPU_TYPE ($ACCELERATOR)"
 echo "  Model:    $MODEL"
 echo "  Epochs:   $EPOCHS  |  ImgSz: $IMGSZ  |  Batch: $BATCH"
+echo "  ClsArch:  $CLS_ARCH  |  ClsCrop: ${CLS_CROP_SIZE:-auto}  |  FP16: $FP16"
 echo "  Zone:     $ZONE"
 echo "══════════════════════════════════════════════════════════"
 
@@ -147,6 +159,7 @@ gcloud compute scp \
   "$SCRIPT_DIR/training/train_detector.py" \
   "$SCRIPT_DIR/training/train_classifier.py" \
   "$SCRIPT_DIR/training/extract_crops.py" \
+  "$SCRIPT_DIR/training/validate_pipeline.py" \
   "$VM_NAME:${REMOTE_DIR}/training/" --zone="$ZONE"
 
 # Upload annotations
@@ -165,6 +178,16 @@ else
   echo ">> Training images already on VM ($IMAGE_COUNT images), skipping."
 fi
 
+# Upload existing weights so training can compare against previous best
+echo ">> Uploading existing weights (if any) for comparison..."
+for f in classifier.pt ref_embeddings.pt detector.pt best.pt; do
+  if [ -f "$SCRIPT_DIR/weights/$f" ]; then
+    gcloud compute scp "$SCRIPT_DIR/weights/$f" \
+      "$VM_NAME:${REMOTE_DIR}/weights/$f" --zone="$ZONE" 2>/dev/null && \
+      echo "   Uploaded $f" || true
+  fi
+done
+
 # Upload product reference images for classifier training
 if [ "$STRATEGY" = "classifier" ] || [ "$STRATEGY" = "two_stage" ]; then
   REF_COUNT=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="ls ${REMOTE_DIR}/data/NM_NGD_product_images/ 2>/dev/null | wc -l" 2>/dev/null || echo "0")
@@ -180,53 +203,60 @@ fi
 
 # ── Step 3: Install dependencies and run training ───────────────────
 echo ">> Installing dependencies and starting training..."
-gcloud compute ssh "$VM_NAME" --zone="$ZONE" -- bash -lc "
-  set -e
-  cd ${REMOTE_DIR}
 
-  # Install system dependency for OpenCV
-  sudo apt-get update -qq && sudo apt-get install -y -qq libgl1-mesa-glx libglib2.0-0
+# Build conditional flags for remote command
+FP16_FLAG=""
+if $FP16; then FP16_FLAG="--fp16"; fi
+CLS_CROP_FLAG=""
+if [ -n "$CLS_CROP_SIZE" ]; then CLS_CROP_FLAG="--crop-size ${CLS_CROP_SIZE}"; fi
 
-  # Use torch 2.5.1 for training (ultralytics 8.1.0 incompatible with torch 2.6 weights_only default)
-  # Weights are exported to ONNX, so torch version mismatch with sandbox (2.6.0) is not an issue
-  pip install -q torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
-  pip install -q ultralytics==8.1.0 opencv-python-headless pillow onnxruntime
+gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="
+set -e
+cd ${REMOTE_DIR}
 
-  # Verify GPU
-  python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"WARNING: No GPU!\")'
+# Install system dependency for OpenCV
+sudo apt-get update -qq && sudo apt-get install -y -qq libgl1-mesa-glx libglib2.0-0
 
-  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Use torch 2.5.1 for training (ultralytics 8.1.0 incompatible with torch 2.6 weights_only default)
+# Weights are exported to ONNX, so torch version mismatch with sandbox (2.6.0) is not an issue
+pip install -q torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+pip install -q ultralytics==8.1.0 opencv-python-headless pillow onnxruntime pycocotools
 
-  case '$STRATEGY' in
-    detector)
-      echo '=== Training single-class detector ==='
-      python3 -m training.train_detector --mode single --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ --batch $BATCH
-      ;;
-    multiclass)
-      echo '=== Training multiclass detector ==='
-      python3 -m training.train_detector --mode multi --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ --batch $BATCH
-      ;;
-    classifier)
-      echo '=== Extracting crops ==='
-      python3 -m training.extract_crops
-      echo '=== Training classifier ==='
-      python3 -m training.train_classifier --epochs $CLS_EPOCHS
-      ;;
-    two_stage)
-      echo '=== Phase 1: Training single-class detector ==='
-      python3 -m training.train_detector --mode single --model $MODEL --epochs $EPOCHS --imgsz $IMGSZ --batch $BATCH
-      echo '=== Phase 2: Extracting crops ==='
-      python3 -m training.extract_crops
-      echo '=== Phase 3: Training classifier ==='
-      python3 -m training.train_classifier --epochs $CLS_EPOCHS
-      ;;
-    *)
-      echo 'Unknown strategy: $STRATEGY'
-      exit 1
-      ;;
-  esac
+# Verify GPU
+python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"WARNING: No GPU!\")'
 
-  echo 'Training complete!'
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+case '${STRATEGY}' in
+  detector)
+    echo '=== Training single-class detector ==='
+    python3 -m training.train_detector --mode single --model ${MODEL} --epochs ${EPOCHS} --imgsz ${IMGSZ} --batch ${BATCH} ${FP16_FLAG}
+    ;;
+  multiclass)
+    echo '=== Training multiclass detector ==='
+    python3 -m training.train_detector --mode multi --model ${MODEL} --epochs ${EPOCHS} --imgsz ${IMGSZ} --batch ${BATCH} ${FP16_FLAG}
+    ;;
+  classifier)
+    echo '=== Extracting crops ==='
+    python3 -m training.extract_crops
+    echo '=== Training classifier ==='
+    python3 -m training.train_classifier --epochs ${CLS_EPOCHS} --batch-size ${CLS_BATCH} --patience ${PATIENCE} --arch ${CLS_ARCH} ${CLS_CROP_FLAG} --detector-path ${REMOTE_DIR}/weights/detector.pt --det-imgsz ${IMGSZ}
+    ;;
+  two_stage)
+    echo '=== Phase 1: Training single-class detector ==='
+    python3 -m training.train_detector --mode single --model ${MODEL} --epochs ${EPOCHS} --imgsz ${IMGSZ} --batch ${BATCH} ${FP16_FLAG}
+    echo '=== Phase 2: Extracting crops ==='
+    python3 -m training.extract_crops
+    echo '=== Phase 3: Training classifier ==='
+    python3 -m training.train_classifier --epochs ${CLS_EPOCHS} --batch-size ${CLS_BATCH} --patience ${PATIENCE} --arch ${CLS_ARCH} ${CLS_CROP_FLAG} --detector-path ${REMOTE_DIR}/weights/detector.pt --det-imgsz ${IMGSZ}
+    ;;
+  *)
+    echo 'Unknown strategy: ${STRATEGY}'
+    exit 1
+    ;;
+esac
+
+echo 'Training complete!'
 "
 
 # ── Step 4: Download weights ─────────────────────────────────────────
@@ -235,33 +265,83 @@ mkdir -p "$SCRIPT_DIR/weights"
 
 case "$STRATEGY" in
   detector)
-    gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
-      "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
+    DET_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/detector_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$DET_IMPROVED" ]; then
+      echo ">> Detector improved (mAP50=$DET_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
+        "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.pt" \
+        "$SCRIPT_DIR/weights/detector.pt" --zone="$ZONE"
+    else
+      echo ">> Detector did NOT improve — keeping existing local weights."
+    fi
     ;;
   multiclass)
-    gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/best.onnx" \
-      "$SCRIPT_DIR/weights/best.onnx" --zone="$ZONE"
+    MC_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/best_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$MC_IMPROVED" ]; then
+      echo ">> Multiclass model improved (mAP50=$MC_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/best.onnx" \
+        "$SCRIPT_DIR/weights/best.onnx" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/best.pt" \
+        "$SCRIPT_DIR/weights/best.pt" --zone="$ZONE"
+    else
+      echo ">> Multiclass model did NOT improve — keeping existing local weights."
+    fi
     ;;
   classifier)
-    gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/classifier.pt" \
-      "$SCRIPT_DIR/weights/classifier.pt" --zone="$ZONE"
-    gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/ref_embeddings.pt" \
-      "$SCRIPT_DIR/weights/ref_embeddings.pt" --zone="$ZONE"
+    CLS_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/classifier_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$CLS_IMPROVED" ]; then
+      echo ">> Classifier improved (score=$CLS_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/classifier.pt" \
+        "$SCRIPT_DIR/weights/classifier.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/ref_embeddings.pt" \
+        "$SCRIPT_DIR/weights/ref_embeddings.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/config.json" \
+        "$SCRIPT_DIR/weights/config.json" --zone="$ZONE" 2>/dev/null || true
+    else
+      echo ">> Classifier did NOT improve — keeping existing local weights."
+    fi
     ;;
   two_stage)
-    gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
-      "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
-    gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/classifier.pt" \
-      "$SCRIPT_DIR/weights/classifier.pt" --zone="$ZONE"
-    gcloud compute scp \
-      "$VM_NAME:${REMOTE_DIR}/weights/ref_embeddings.pt" \
-      "$SCRIPT_DIR/weights/ref_embeddings.pt" --zone="$ZONE"
+    DET_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/detector_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$DET_IMPROVED" ]; then
+      echo ">> Detector improved (mAP50=$DET_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
+        "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.pt" \
+        "$SCRIPT_DIR/weights/detector.pt" --zone="$ZONE"
+    else
+      echo ">> Detector did NOT improve — keeping existing local weights."
+    fi
+    CLS_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/classifier_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$CLS_IMPROVED" ]; then
+      echo ">> Classifier improved (score=$CLS_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/classifier.pt" \
+        "$SCRIPT_DIR/weights/classifier.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/ref_embeddings.pt" \
+        "$SCRIPT_DIR/weights/ref_embeddings.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/config.json" \
+        "$SCRIPT_DIR/weights/config.json" --zone="$ZONE" 2>/dev/null || true
+    else
+      echo ">> Classifier did NOT improve — keeping existing local weights."
+    fi
     ;;
 esac
 

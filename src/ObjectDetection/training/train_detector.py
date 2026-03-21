@@ -11,10 +11,20 @@ import argparse
 import shutil
 from pathlib import Path
 
+import ultralytics.utils.metrics as _metrics
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parent.parent
 WEIGHTS_DIR = ROOT / "weights"
+
+
+def _map50_fitness(x):
+    """Select best checkpoint by mAP@0.5 only (competition metric)."""
+    w = [0.0, 0.0, 1.0, 0.0]  # [P, R, mAP@0.5, mAP@0.5:0.95]
+    return (x[:, :4] * w).sum(1)
+
+
+_metrics.fitness = _map50_fitness
 
 
 def prepare_single_class():
@@ -62,15 +72,36 @@ def prepare_multiclass():
     return yaml_path
 
 
-def train(mode: str, model_name: str, epochs: int, imgsz: int, batch: int = 16):
+def _eval_map50(model_path: str, data_yaml: str, imgsz: int) -> float:
+    """Evaluate a YOLO model and return mAP@0.5."""
+    m = YOLO(model_path)
+    results = m.val(data=data_yaml, imgsz=imgsz, verbose=False)
+    return float(results.box.map50)
+
+
+def train(mode: str, model_name: str, epochs: int, imgsz: int, batch: int = 16,
+          fp16: bool = False):
     WEIGHTS_DIR.mkdir(exist_ok=True)
 
     if mode == "single":
         data_yaml = prepare_single_class()
         out_name = "detector"
+        dst = WEIGHTS_DIR / "detector.pt"
     else:
         data_yaml = prepare_multiclass()
         out_name = "multiclass"
+        dst = WEIGHTS_DIR / "best.pt"
+
+    marker_path = WEIGHTS_DIR / f"{dst.stem}_updated"
+    marker_path.unlink(missing_ok=True)
+
+    # Evaluate existing weights to establish baseline
+    existing_map50 = 0.0
+    if dst.exists():
+        print(f"\n=== Evaluating existing {dst.name} ===")
+        existing_map50 = _eval_map50(str(dst), str(data_yaml), imgsz)
+        print(f"  Existing mAP@0.5: {existing_map50:.4f}")
+        print(f"  New model must beat {existing_map50:.4f} to save weights\n")
 
     model = YOLO(model_name)
     model.train(
@@ -83,24 +114,31 @@ def train(mode: str, model_name: str, epochs: int, imgsz: int, batch: int = 16):
         exist_ok=True,
     )
 
-    # Copy best weights to weights/
+    # Evaluate the new best checkpoint
     best_src = ROOT / "runs" / out_name / "weights" / "best.pt"
-    if mode == "single":
-        dst = WEIGHTS_DIR / "detector.pt"
-    else:
-        dst = WEIGHTS_DIR / "best.pt"
-    shutil.copy2(best_src, dst)
-    print(f"\nSaved weights to {dst}")
+    new_map50 = _eval_map50(str(best_src), str(data_yaml), imgsz)
+    print(f"\nNew model mAP@0.5:      {new_map50:.4f}")
+    print(f"Existing model mAP@0.5: {existing_map50:.4f}")
 
-    # Export to ONNX (pickle-free, compatible with any torch version)
-    best_model = YOLO(str(dst))
-    onnx_name = dst.stem + ".onnx"
-    best_model.export(format="onnx", imgsz=imgsz, opset=17)
-    onnx_src = dst.with_suffix(".onnx")
-    onnx_dst = WEIGHTS_DIR / onnx_name
-    if onnx_src != onnx_dst:
-        shutil.move(str(onnx_src), str(onnx_dst))
-    print(f"Exported ONNX to {onnx_dst}")
+    if new_map50 > existing_map50:
+        shutil.copy2(best_src, dst)
+        print(f"Improvement! Saved weights to {dst}")
+
+        # Export to ONNX
+        best_model = YOLO(str(dst))
+        onnx_name = dst.stem + ".onnx"
+        best_model.export(format="onnx", imgsz=imgsz, opset=17, half=fp16)
+        if fp16:
+            print(f"  Exported as FP16 (half precision)")
+        onnx_src = dst.with_suffix(".onnx")
+        onnx_dst = WEIGHTS_DIR / onnx_name
+        if onnx_src != onnx_dst:
+            shutil.move(str(onnx_src), str(onnx_dst))
+        print(f"Exported ONNX to {onnx_dst}")
+
+        marker_path.write_text(f"{new_map50:.6f}")
+    else:
+        print(f"No improvement — keeping existing {dst.name}")
 
 
 if __name__ == "__main__":
@@ -111,6 +149,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--fp16", action="store_true",
+                        help="Export ONNX in FP16 (halves weight size)")
     args = parser.parse_args()
 
-    train(mode=args.mode, model_name=args.model, epochs=args.epochs, imgsz=args.imgsz, batch=args.batch)
+    train(mode=args.mode, model_name=args.model, epochs=args.epochs,
+          imgsz=args.imgsz, batch=args.batch, fp16=args.fp16)

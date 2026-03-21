@@ -57,7 +57,7 @@ INITIAL_TERRAIN_COLORS = {
     11: "#C8E6C9",  # Plains — light green
 }
 
-LEARNED_MODEL_PATH = os.path.join(os.path.dirname(__file__), "learned_priors.npz")
+LEARNED_MODEL_PATH = os.path.join(os.path.dirname(__file__), "learned_priors_v3.npz")
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
 
 
@@ -532,7 +532,7 @@ def show_learned_priors_section():
     st.subheader("Transition Probabilities")
     st.caption("P(final class | initial terrain, distance bucket, coastal, forest-adjacent)")
 
-    dist_labels = ["On-site (0)", "Near (1-2)", "Medium (3-5)", "Far (6+)"]
+    dist_labels = ["On-site (0)", "Adjacent (1)", "Near (2)", "Medium (3-4)", "Far (5-7)", "Remote (8+)"]
 
     selected_terrain = st.selectbox(
         "Initial terrain type",
@@ -542,7 +542,6 @@ def show_learned_priors_section():
     )
 
     # Show heatmaps: rows = distance buckets, columns = final classes
-    # Aggregate over coastal/forest for a summary view
     for coastal in range(2):
         for forest in range(2):
             label = f"{'Coastal' if coastal else 'Inland'}, {'Forest-adj' if forest else 'No forest'}"
@@ -550,7 +549,7 @@ def show_learned_priors_section():
             if n < 10:
                 continue
 
-            probs = learned[selected_terrain, :, coastal, forest]  # (4, 6)
+            probs = learned[selected_terrain, :, coastal, forest]  # (6, 6)
             fig = go.Figure(data=go.Heatmap(
                 z=probs,
                 x=CLASS_NAMES,
@@ -563,10 +562,10 @@ def show_learned_priors_section():
             ))
             fig.update_layout(
                 title=f"{label} (n={int(n)})",
-                height=250,
+                height=300,
                 margin=dict(l=40, r=40, t=50, b=40),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"prior_heatmap_{coastal}_{forest}")
 
 
 # ---------------------------------------------------------------------------
@@ -685,11 +684,11 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             fig_terrain = make_terrain_heatmap(grid, title=f"Terrain Grid (Seed {seed_idx + 1})")
-            st.plotly_chart(fig_terrain, use_container_width=True)
+            st.plotly_chart(fig_terrain, use_container_width=True, key="tab1_terrain")
 
         with col2:
             fig_dist = make_settlement_distance_heatmap(settlements, map_h, map_w)
-            st.plotly_chart(fig_dist, use_container_width=True)
+            st.plotly_chart(fig_dist, use_container_width=True, key="tab1_dist")
 
         # Settlement info
         st.subheader("Settlements")
@@ -717,7 +716,7 @@ def main():
             marker_color=[INITIAL_TERRAIN_COLORS.get(int(v), "#999") for v in unique],
         ))
         fig_bar.update_layout(title="Cell Count by Terrain Type", height=350)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, use_container_width=True, key="tab1_bar")
 
     # === TAB 2: Cached Observations ===
     with tabs[1]:
@@ -752,7 +751,7 @@ def main():
                     height=500,
                     margin=dict(l=40, r=40, t=50, b=40),
                 )
-                st.plotly_chart(fig_obs_count, use_container_width=True)
+                st.plotly_chart(fig_obs_count, use_container_width=True, key="tab2_obs_count")
 
             with col2:
                 # Empirical argmax from observations
@@ -770,7 +769,7 @@ def main():
                     empirical_argmax, title="Empirical Class (from observations)",
                     confidence=empirical_conf,
                 )
-                st.plotly_chart(fig_emp, use_container_width=True)
+                st.plotly_chart(fig_emp, use_container_width=True, key="tab2_emp")
 
             # Coverage stats
             total_cells = map_h * map_w
@@ -803,7 +802,7 @@ def main():
                     )
 
                 fig_vp.update_layout(height=550)
-                st.plotly_chart(fig_vp, use_container_width=True)
+                st.plotly_chart(fig_vp, use_container_width=True, key="tab2_vp")
 
     # === TAB 3: Predictions ===
     with tabs[2]:
@@ -834,13 +833,13 @@ def main():
                     argmax_grid, title="Predicted Classes (argmax)",
                     confidence=confidence_grid,
                 )
-                st.plotly_chart(fig_pred, use_container_width=True)
+                st.plotly_chart(fig_pred, use_container_width=True, key="tab3_pred")
 
             with col2:
                 fig_conf = make_confidence_heatmap(
                     confidence_grid, title="Prediction Confidence",
                 )
-                st.plotly_chart(fig_conf, use_container_width=True)
+                st.plotly_chart(fig_conf, use_container_width=True, key="tab3_conf")
 
             # Prediction class distribution
             st.subheader("Predicted Class Distribution")
@@ -852,7 +851,7 @@ def main():
                 marker_color=[CLASS_COLORS[int(v)] for v in unique_p],
             ))
             fig_bar_pred.update_layout(title="Predicted Cell Count by Class", height=350)
-            st.plotly_chart(fig_bar_pred, use_container_width=True)
+            st.plotly_chart(fig_bar_pred, use_container_width=True, key="tab3_bar_pred")
 
             # Confidence distribution
             st.subheader("Confidence Distribution")
@@ -866,7 +865,7 @@ def main():
                 xaxis_title="Confidence", yaxis_title="Count",
                 height=300,
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, use_container_width=True, key="tab3_hist")
 
     # === TAB 4: Ground Truth & Analysis ===
     with tabs[3]:
@@ -889,11 +888,11 @@ def main():
                 col1, col2 = st.columns(2)
                 with col1:
                     fig_gt = make_class_heatmap(gt_argmax, title="Ground Truth (argmax)")
-                    st.plotly_chart(fig_gt, use_container_width=True)
+                    st.plotly_chart(fig_gt, use_container_width=True, key="tab4_gt")
 
                 with col2:
                     fig_gt_ent = make_entropy_heatmap(gt, title="Ground Truth Entropy")
-                    st.plotly_chart(fig_gt_ent, use_container_width=True)
+                    st.plotly_chart(fig_gt_ent, use_container_width=True, key="tab4_gt_ent")
 
                 # If we have prediction too, show comparison
                 pred_data = analysis.get("prediction")
@@ -906,11 +905,11 @@ def main():
                     col1, col2 = st.columns(2)
                     with col1:
                         fig_diff = make_diff_heatmap(pred_argmax, gt_argmax)
-                        st.plotly_chart(fig_diff, use_container_width=True)
+                        st.plotly_chart(fig_diff, use_container_width=True, key="tab4_diff")
 
                     with col2:
                         fig_kl = make_kl_heatmap(pred, gt)
-                        st.plotly_chart(fig_kl, use_container_width=True)
+                        st.plotly_chart(fig_kl, use_container_width=True, key="tab4_kl")
 
                     # Accuracy summary
                     total = gt_argmax.size
@@ -964,17 +963,17 @@ def main():
                         yaxis_title="Ground Truth",
                         height=450,
                     )
-                    st.plotly_chart(fig_conf_mat, use_container_width=True)
+                    st.plotly_chart(fig_conf_mat, use_container_width=True, key="tab4_conf_mat")
 
                     # Side-by-side entropy
                     st.subheader("Entropy Comparison")
                     col1, col2 = st.columns(2)
                     with col1:
                         fig_pred_ent = make_entropy_heatmap(pred, title="Prediction Entropy")
-                        st.plotly_chart(fig_pred_ent, use_container_width=True)
+                        st.plotly_chart(fig_pred_ent, use_container_width=True, key="tab4_pred_ent")
                     with col2:
                         fig_gt_ent2 = make_entropy_heatmap(gt, title="Ground Truth Entropy")
-                        st.plotly_chart(fig_gt_ent2, use_container_width=True)
+                        st.plotly_chart(fig_gt_ent2, use_container_width=True, key="tab4_gt_ent2")
 
     # === TAB 5: Per-Class Probabilities ===
     with tabs[4]:
@@ -1013,7 +1012,7 @@ def main():
                                 prob_data, cls_idx,
                                 title=f"P({CLASS_NAMES[cls_idx]})",
                             )
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True, key=f"tab5_class_{cls_idx}")
 
             # Cell inspector
             st.subheader("Cell Inspector")
@@ -1035,7 +1034,7 @@ def main():
                 yaxis_range=[0, 1],
                 height=350,
             )
-            st.plotly_chart(fig_cell, use_container_width=True)
+            st.plotly_chart(fig_cell, use_container_width=True, key="tab5_cell")
 
     # === TAB 6: Learned Priors ===
     with tabs[5]:
@@ -1072,7 +1071,7 @@ def main():
                     xaxis_title="Team", yaxis_title="Score",
                     height=400,
                 )
-                st.plotly_chart(fig_lb, use_container_width=True)
+                st.plotly_chart(fig_lb, use_container_width=True, key="tab7_lb")
             else:
                 st.info("No leaderboard data available.")
         except Exception as e:

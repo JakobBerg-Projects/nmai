@@ -236,4 +236,11 @@ Run around 90 epochs for detection.
 
 
 
-./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 300 --imgsz 1280 --batch 6 --cls-epochs 100 --gpu l4 --zone europe-west1-b
+./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 90 --imgsz 1280 --batch 6 --cls-epochs 100 --patience 15 --gpu l4 --zone europe-west1-b
+
+./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 300 --imgsz 1280 --batch 16 --cls-epochs 100 --cls-batch 512 --patience 15 --vm-name instance-20260320-232652 --zone us-central1-f
+
+./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 100 --imgsz 1280 --batch 4 \
+  --cls-epochs 100 --cls-batch 64 --patience 15 \
+  --cls-arch efficientnet_v2_s \
+  --vm-name nmai-a100 --zone us-central1-f
