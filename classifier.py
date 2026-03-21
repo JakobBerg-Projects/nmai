@@ -114,12 +114,21 @@ _KW = {
 }
 
 
+import re
+
+def _strip_noise(text: str) -> str:
+    """Remove email addresses, URLs, and org numbers that cause false keyword matches."""
+    text = re.sub(r'\S+@\S+\.\S+', ' ', text)
+    text = re.sub(r'https?://\S+', ' ', text)
+    return text
+
+
 def _has(text: str, keywords: list[str]) -> bool:
     return any(kw in text for kw in keywords)
 
 
 def classify_task(prompt: str) -> TaskType:
-    p = prompt.lower()
+    p = _strip_noise(prompt.lower())
 
     if _has(p, _KW["opening"]):
         return TaskType.OPENING_BALANCE

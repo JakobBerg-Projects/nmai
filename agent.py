@@ -306,6 +306,20 @@ async def run_agent(
             messages.append({"role": "user", "content": tool_results})
 
     finally:
+        elapsed = time.monotonic() - start
+        write_calls = sum(
+            1 for m in messages if m["role"] == "user"
+            for tc in (m["content"] if isinstance(m["content"], list) else [])
+            if isinstance(tc, dict) and tc.get("type") == "tool_result"
+        )
+        error_count = sum(
+            1 for m in messages if m["role"] == "user"
+            for tc in (m["content"] if isinstance(m["content"], list) else [])
+            if isinstance(tc, dict) and tc.get("type") == "tool_result"
+            and '"success": false' in tc.get("content", "").lower()
+        )
+        logger.info(
+            "TASK_REPORT: task=%s iterations=%d elapsed=%.1fs write_calls=%d errors=%d",
+            task_type.value, iterations, elapsed, write_calls, error_count,
+        )
         await tripletex.close()
-
-    logger.info("Done: %d iterations, %.1fs", iterations, time.monotonic() - start)
