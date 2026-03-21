@@ -30,30 +30,87 @@ class TaskType(Enum):
 
 
 _KW = {
-    "employee": ["ansatt", "employee", "mitarbeiter", "employé", "empleado", "funcionário"],
-    "customer": ["kunde", "customer", "klient", "client", "cliente"],
-    "supplier": ["leverandør", "supplier", "lieferant", "fournisseur", "proveedor", "fornecedor"],
-    "product": ["produkt", "product", "produit", "producto", "produto"],
-    "department": ["avdeling", "department", "abteilung", "département", "departamento"],
-    "project": ["prosjekt", "project", "projekt", "projet", "proyecto", "projeto"],
-    "invoice": ["faktura", "invoice", "rechnung", "facture", "factura", "fatura"],
+    "employee": [
+        "ansatt", "employee", "mitarbeiter", "employé", "empleado", "funcionário",
+        "medarbeider", "personalopplysninger",
+    ],
+    "customer": [
+        "kunde", "customer", "klient", "client", "cliente", "kundeforhold",
+    ],
+    "supplier": [
+        "leverandør", "supplier", "lieferant", "fournisseur", "proveedor", "fornecedor",
+    ],
+    "product": [
+        "produkt", "product", "produit", "producto", "produto", "vare ", "varenummer",
+    ],
+    "department": [
+        "avdeling", "department", "abteilung", "département", "departamento",
+    ],
+    "project": [
+        "prosjekt", "project", "projekt", "projet", "proyecto", "projeto",
+    ],
+    "invoice": [
+        "faktura", "invoice", "rechnung", "facture", "factura", "fatura",
+        "fakturere", "fakturering",
+    ],
     "travel": [
         "reiseregning", "travel expense", "reisekosten", "note de frais",
-        "gasto de viaje", "despesa de viagem", "reiserekning",
+        "gasto de viaje", "despesa de viagem", "reiserekning", "tjenestereise",
+        "diett", "kilometergodtgjørelse", "kjøregodtgjørelse",
     ],
-    "emp_expense": ["ansattutlegg", "employee expense"],
-    "payment": ["betaling", "payment", "zahlung", "paiement", "pago", "pagamento", "innbetaling"],
-    "credit_note": ["kreditnota", "credit note", "gutschrift", "avoir", "nota de crédito"],
-    "reminder": ["purring", "reminder", "mahnung", "rappel", "recordatorio", "lembrete", "inkassovarsel"],
-    "voucher": ["bilag", "voucher", "bokføring", "buchung", "écriture", "asiento", "lançamento"],
-    "timesheet": ["timer", "timesheet", "hours", "tid", "stunden", "heures", "horas", "timeliste"],
-    "contact": ["kontaktperson", "contact person", "kontakt"],
-    "delete": ["slett", "fjern", "delete", "remove", "löschen", "supprimer", "eliminar", "excluir"],
-    "update": ["oppdater", "endre", "update", "modify", "änder", "modifier", "actualizar", "atualizar"],
-    "opening": ["åpningsbalanse", "inngående balanse", "opening balance", "eröffnungsbilanz"],
-    "yearend": ["årsavslutning", "year-end", "year end", "jahresabschluss", "clôture annuelle"],
-    "bank_rec": ["bankavsteming", "bank reconciliation", "kontoavstemming", "bankabstimmung"],
-    "supplier_inv": ["leverandørfaktura", "supplier invoice", "lieferantenrechnung", "facture fournisseur"],
+    "emp_expense": [
+        "ansattutlegg", "employee expense", "utlegg", "expense report",
+    ],
+    "payment": [
+        "betaling", "payment", "zahlung", "paiement", "pago", "pagamento",
+        "innbetaling", "betalt", "betal ",
+    ],
+    "credit_note": [
+        "kreditnota", "credit note", "gutschrift", "avoir", "nota de crédito",
+        "kreditere",
+    ],
+    "reminder": [
+        "purring", "reminder", "mahnung", "rappel", "recordatorio", "lembrete",
+        "inkassovarsel", "betalingspåminnelse", "påminnelse",
+    ],
+    "voucher": [
+        "bilag", "voucher", "bokføring", "buchung", "écriture", "asiento",
+        "lançamento", "bokfør", "posteringer", "kontering",
+    ],
+    "timesheet": [
+        "timer", "timesheet", "hours", "tid", "stunden", "heures", "horas",
+        "timeliste", "timeregistrering", "timeføring",
+    ],
+    "contact": [
+        "kontaktperson", "contact person", "kontakt",
+    ],
+    "delete": [
+        "slett", "fjern", "delete", "remove", "löschen", "supprimer", "eliminar",
+        "excluir", "reverser",
+    ],
+    "update": [
+        "oppdater", "endre", "update", "modify", "änder", "modifier", "actualizar",
+        "atualizar", "rett opp", "korriger",
+    ],
+    "opening": [
+        "åpningsbalanse", "inngående balanse", "opening balance", "eröffnungsbilanz",
+        "ib ", "åpningsbalanser",
+    ],
+    "yearend": [
+        "årsavslutning", "year-end", "year end", "jahresabschluss", "clôture annuelle",
+        "årsoppgjør", "årsregnskap",
+    ],
+    "bank_rec": [
+        "bankavsteming", "bank reconciliation", "kontoavstemming", "bankabstimmung",
+        "bankavstemming", "bankutskrift",
+    ],
+    "supplier_inv": [
+        "leverandørfaktura", "supplier invoice", "lieferantenrechnung",
+        "facture fournisseur", "inngående faktura",
+    ],
+    "salary": [
+        "lønn", "lønnskjøring", "salary", "payroll", "gehalt",
+    ],
 }
 
 
@@ -72,6 +129,8 @@ def classify_task(prompt: str) -> TaskType:
         return TaskType.BANK_RECONCILIATION
 
     if _has(p, _KW["delete"]):
+        if _has(p, _KW["travel"]) or _has(p, _KW["emp_expense"]):
+            return TaskType.CREATE_TRAVEL_EXPENSE
         return TaskType.DELETE_ENTITY
 
     if _has(p, _KW["travel"]):
@@ -101,9 +160,11 @@ def classify_task(prompt: str) -> TaskType:
         return TaskType.CREATE_PROJECT
     if _has(p, _KW["voucher"]):
         return TaskType.CREATE_VOUCHER
+    if _has(p, _KW["salary"]):
+        return TaskType.CREATE_VOUCHER
     if _has(p, _KW["department"]):
         return TaskType.CREATE_DEPARTMENT
-    if _has(p, _KW["contact"]):
+    if _has(p, _KW["contact"]) and _has(p, _KW["customer"]):
         return TaskType.CREATE_CONTACT
     if _has(p, _KW["supplier"]):
         return TaskType.CREATE_SUPPLIER
@@ -117,6 +178,9 @@ def classify_task(prompt: str) -> TaskType:
             return TaskType.UPDATE_EMPLOYEE
         return TaskType.CREATE_EMPLOYEE
 
+    if _has(p, _KW["contact"]):
+        return TaskType.CREATE_CONTACT
+
     return TaskType.UNKNOWN
 
 
@@ -128,12 +192,12 @@ SECTION_MAP: dict[TaskType, list[str]] = {
     TaskType.CREATE_SUPPLIER: ["supplier"],
     TaskType.CREATE_SUPPLIER_INVOICE: ["supplier", "supplier_invoice"],
     TaskType.CREATE_PRODUCT: ["product"],
-    TaskType.CREATE_ORDER: ["order", "product"],
-    TaskType.CREATE_INVOICE: ["customer", "order", "invoice", "product", "payment"],
+    TaskType.CREATE_ORDER: ["order", "product", "customer"],
+    TaskType.CREATE_INVOICE: ["customer", "order", "invoice", "product", "payment", "contact"],
     TaskType.REGISTER_PAYMENT: ["invoice", "payment"],
     TaskType.CREATE_CREDIT_NOTE: ["invoice", "credit_note"],
     TaskType.CREATE_REMINDER: ["invoice", "reminder"],
-    TaskType.CREATE_PROJECT: ["employee", "project"],
+    TaskType.CREATE_PROJECT: ["employee", "project", "customer"],
     TaskType.CREATE_TIMESHEET: ["employee", "project", "timesheet"],
     TaskType.CREATE_DEPARTMENT: ["department"],
     TaskType.CREATE_TRAVEL_EXPENSE: ["employee", "travel_expense"],
@@ -142,7 +206,7 @@ SECTION_MAP: dict[TaskType, list[str]] = {
     TaskType.DELETE_ENTITY: ["corrections"],
     TaskType.OPENING_BALANCE: ["voucher", "opening_balance"],
     TaskType.YEAR_END_CLOSING: ["voucher", "year_end_closing"],
-    TaskType.BANK_RECONCILIATION: ["bank_reconciliation"],
+    TaskType.BANK_RECONCILIATION: ["bank_reconciliation", "voucher"],
     TaskType.UNKNOWN: [],
 }
 

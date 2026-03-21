@@ -7,11 +7,13 @@ import httpx
 
 logger = logging.getLogger("tripletex-api")
 
-MAX_RESPONSE_CHARS = 6000
+MAX_RESPONSE_CHARS = 8000
 
 IMPORTANT_KEYS = {"id", "version", "name", "amount", "amountOutstanding", "amountCurrency",
                   "invoiceNumber", "number", "firstName", "lastName", "email",
-                  "value", "fullResultSize", "status", "description", "error", "message"}
+                  "value", "fullResultSize", "status", "description", "error", "message",
+                  "userType", "isCustomer", "isSupplier", "organizationNumber",
+                  "accountNumber", "title", "date", "invoiceDate", "dueDate"}
 
 
 class TripletexClient:
@@ -19,7 +21,7 @@ class TripletexClient:
         self.base_url = base_url.rstrip("/")
         self.auth = ("0", session_token)
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(45.0, connect=10.0),
+            timeout=httpx.Timeout(60.0, connect=15.0),
         )
 
     async def request(
@@ -71,7 +73,7 @@ class TripletexClient:
         url: str,
         params: dict[str, Any] | None,
         json_body: dict[str, Any] | None,
-        retries: int = 1,
+        retries: int = 2,
     ) -> httpx.Response | None:
         for attempt in range(retries + 1):
             try:
@@ -83,20 +85,23 @@ class TripletexClient:
                     auth=self.auth,
                 )
                 if resp.status_code >= 500 and attempt < retries:
-                    logger.warning("Server error %d, retrying in 2s...", resp.status_code)
-                    await asyncio.sleep(2)
+                    wait = 1 + attempt
+                    logger.warning("Server error %d, retrying in %ds...", resp.status_code, wait)
+                    await asyncio.sleep(wait)
                     continue
                 return resp
             except httpx.TimeoutException:
                 if attempt < retries:
-                    logger.warning("Timeout, retrying in 2s...")
-                    await asyncio.sleep(2)
+                    wait = 2 + attempt
+                    logger.warning("Timeout, retrying in %ds...", wait)
+                    await asyncio.sleep(wait)
                     continue
                 return _error_response(408, "Request timed out")
             except Exception as e:
                 if attempt < retries:
-                    logger.warning("Error %s, retrying in 2s...", e)
-                    await asyncio.sleep(2)
+                    wait = 2 + attempt
+                    logger.warning("Error %s, retrying in %ds...", e, wait)
+                    await asyncio.sleep(wait)
                     continue
                 return _error_response(500, str(e)[:200])
         return None
@@ -123,7 +128,7 @@ def _truncate(data: Any, max_chars: int) -> Any:
     if isinstance(data, dict):
         if "values" in data and isinstance(data["values"], list):
             values = data["values"]
-            for limit in [15, 5, 2]:
+            for limit in [20, 10, 5, 2]:
                 truncated = values[:limit]
                 candidate = {**data, "values": truncated}
                 if len(values) > limit:

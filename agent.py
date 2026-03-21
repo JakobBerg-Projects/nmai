@@ -21,20 +21,26 @@ logger = logging.getLogger("agent")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-MAX_AGENT_TIME_SECONDS = 240
-MAX_ITERATIONS = 25
-MAX_CONSECUTIVE_ERRORS = 3
+MAX_AGENT_TIME_SECONDS = 270
+MAX_ITERATIONS = 30
+MAX_CONSECUTIVE_ERRORS = 4
 
 PREFETCH_LOOKUPS: dict[str, tuple[str, dict[str, Any]]] = {
-    "departments": ("/department", {"fields": "id,name", "count": 10}),
+    "departments": ("/department", {"fields": "id,name,departmentNumber", "count": 20}),
     "invoice_payment_types": ("/invoice/paymentType", {"fields": "id,description"}),
     "outgoing_payment_types": ("/ledger/paymentTypeOut", {"fields": "id,description"}),
-    "activities": ("/activity", {"fields": "id,name", "count": 10}),
-    "project_categories": ("/project/category", {"fields": "id,name"}),
-    "vat_types": ("/ledger/vatType", {"fields": "id,name,number", "count": 10}),
+    "activities": ("/activity", {"fields": "id,name,number", "count": 20}),
+    "project_categories": ("/project/category", {"fields": "id,name,number"}),
+    "vat_types": ("/ledger/vatType", {"fields": "id,name,number", "count": 20}),
     "travel_payment_types": ("/travelExpense/paymentType", {"fields": "id,description"}),
-    "travel_cost_categories": ("/travelExpense/costCategory", {"fields": "id,description", "count": 15}),
-    "travel_rate_categories": ("/travelExpense/rateCategory", {"fields": "id,name", "count": 10}),
+    "travel_cost_categories": ("/travelExpense/costCategory", {"fields": "id,description", "count": 30}),
+    "travel_rate_categories": ("/travelExpense/rateCategory", {"fields": "id,name,type", "count": 20}),
+    "employees": ("/employee", {"fields": "id,firstName,lastName,email,userType", "count": 50}),
+    "customers": ("/customer", {"fields": "id,name,email,organizationNumber", "count": 50}),
+    "suppliers": ("/supplier", {"fields": "id,name,email,organizationNumber", "count": 50}),
+    "accounts": ("/ledger/account", {"fields": "id,number,name", "count": 100}),
+    "bank_accounts": ("/bank", {"fields": "id,name,accountNumber"}),
+    "currencies": ("/currency", {"fields": "id,code", "count": 5}),
 }
 
 
@@ -62,7 +68,8 @@ async def _prefetch(tripletex: TripletexClient) -> tuple[dict[str, list], str]:
         key, vals = item
         ref[key] = vals
         if vals:
-            lines.append(f"  {key}: {json.dumps(vals, ensure_ascii=False)[:600]}")
+            max_chars = 1200 if key in ("accounts", "employees", "customers", "suppliers") else 800
+            lines.append(f"  {key}: {json.dumps(vals, ensure_ascii=False)[:max_chars]}")
 
     return ref, "\n".join(lines) if len(lines) > 1 else ""
 
@@ -127,9 +134,12 @@ async def _try_fast_path(
         resp = client.messages.create(
             model=MODEL,
             max_tokens=2048,
+            temperature=0,
             system=(
                 "Extract ALL values from the task and call the tool. "
-                "Use values EXACTLY as written. Do NOT modify names, emails, or amounts."
+                "Use values EXACTLY as written. Do NOT modify names, emails, or amounts. "
+                "If the task mentions a role like kontoadministrator/admin, set role='ALL_PRIVILEGES'. "
+                "If it mentions prosjektleder, set role='DEPARTMENT_LEADER'."
             ),
             tools=[tool_def],
             messages=[{"role": "user", "content": user_content}],
@@ -201,6 +211,7 @@ async def run_agent(
                 response = client.messages.create(
                     model=MODEL,
                     max_tokens=4096,
+                    temperature=0,
                     system=system_with_cache,
                     tools=TOOL_DEFINITIONS,
                     messages=messages,
@@ -272,7 +283,14 @@ async def run_agent(
                             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                                 rd["_hint"] = (
                                     f"WARNING: {consecutive_errors} consecutive errors. "
-                                    "Stop retrying. Try a DIFFERENT approach or finish now."
+                                    "Stop retrying the same approach. Try tripletex_api as fallback, "
+                                    "try a DIFFERENT approach, or create prerequisite entities for partial credit."
+                                )
+                                rstr = json.dumps(rd, ensure_ascii=False)
+                            elif consecutive_errors >= 2:
+                                rd["_hint"] = (
+                                    "Multiple errors. Read the error message carefully. "
+                                    "Check required fields, correct IDs, and try again with fixes."
                                 )
                                 rstr = json.dumps(rd, ensure_ascii=False)
                     except (json.JSONDecodeError, AttributeError):

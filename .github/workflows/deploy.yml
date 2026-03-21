@@ -54,7 +54,7 @@ jobs:
             --platform=managed \
             --allow-unauthenticated \
             --timeout=300 \
-            --memory=512Mi \
+            --memory=1Gi \
             --cpu=1 \
             --min-instances=1 \
             --max-instances=10 \
