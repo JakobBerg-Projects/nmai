@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────
+# GCP Remote GPU Training
+# Usage:
+#   ./gcp_train.sh --strategy detector --model yolov8x.pt --epochs 100
+#   ./gcp_train.sh --strategy classifier --epochs 30
+#   ./gcp_train.sh --strategy two_stage   # runs detector + crops + classifier
+#   ./gcp_train.sh --strategy multiclass --model yolov8x.pt --epochs 100
+#   ./gcp_train.sh --delete               # tear down the VM
+# ─────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Defaults ────────────────────────────────────────────────────────
+GPU_TYPE="t4"
+MODEL="yolov8x.pt"
+EPOCHS=100
+IMGSZ=640
+STRATEGY="detector"
+BATCH=16
+CLS_BATCH=64
+CLS_EPOCHS=30
+CLS_ARCH="resnet50"
+CLS_CROP_SIZE=""
+PATIENCE=10
+FP16=false
+DELETE_ONLY=false
+
+ZONE="europe-west1-b"
+VM_NAME="${VM_NAME:-yolo-training}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── Parse args ──────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gpu)        GPU_TYPE="$2"; shift 2 ;;
+    --model)      MODEL="$2"; shift 2 ;;
+    --epochs)     EPOCHS="$2"; shift 2 ;;
+    --imgsz)      IMGSZ="$2"; shift 2 ;;
+    --strategy)   STRATEGY="$2"; shift 2 ;;
+    --batch)      BATCH="$2"; shift 2 ;;
+    --cls-epochs) CLS_EPOCHS="$2"; shift 2 ;;
+    --cls-batch)  CLS_BATCH="$2"; shift 2 ;;
+    --patience)   PATIENCE="$2"; shift 2 ;;
+    --cls-arch)   CLS_ARCH="$2"; shift 2 ;;
+    --cls-crop-size) CLS_CROP_SIZE="$2"; shift 2 ;;
+    --fp16)       FP16=true; shift ;;
+    --vm-name)    VM_NAME="$2"; shift 2 ;;
+    --zone)       ZONE="$2"; shift 2 ;;
+    --delete)     DELETE_ONLY=true; shift ;;
+    *) echo "Unknown arg: $1"; exit 1 ;;
+  esac
+done
+
+# ── GPU config mapping ──────────────────────────────────────────────
+case "$GPU_TYPE" in
+  t4)
+    ACCELERATOR="type=nvidia-tesla-t4,count=1"
+    MACHINE_TYPE="n1-standard-8"
+    ;;
+  l4)
+    ACCELERATOR="type=nvidia-l4,count=1"
+    MACHINE_TYPE="g2-standard-8"
+    ;;
+  a100)
+    ACCELERATOR="type=nvidia-tesla-a100,count=1"
+    MACHINE_TYPE="a2-highgpu-1g"
+    ;;
+  a100-80)
+    ACCELERATOR="type=nvidia-a100-80gb,count=1"
+    MACHINE_TYPE="a2-ultragpu-1g"
+    ;;
+  h100)
+    ACCELERATOR="type=nvidia-h100-80gb,count=1"
+    MACHINE_TYPE="a3-highgpu-1g"
+    ;;
+  b200)
+    ACCELERATOR="type=nvidia-b200,count=1"
+    MACHINE_TYPE="a4-highgpu-1g"
+    ;;
+  *)
+    echo "Unsupported GPU: $GPU_TYPE (use t4, l4, a100, a100-80, h100, b200)"
+    exit 1
+    ;;
+esac
+
+# ── Delete mode ─────────────────────────────────────────────────────
+if $DELETE_ONLY; then
+  echo "Deleting VM '$VM_NAME'..."
+  gcloud compute instances delete "$VM_NAME" --zone="$ZONE" --quiet 2>/dev/null || echo "VM not found."
+  exit 0
+fi
+
+echo "══════════════════════════════════════════════════════════"
+echo "  GCP Remote Training"
+echo "  Strategy: $STRATEGY"
+echo "  GPU:      $GPU_TYPE ($ACCELERATOR)"
+echo "  Model:    $MODEL"
+echo "  Epochs:   $EPOCHS  |  ImgSz: $IMGSZ  |  Batch: $BATCH"
+echo "  ClsArch:  $CLS_ARCH  |  ClsCrop: ${CLS_CROP_SIZE:-auto}  |  FP16: $FP16"
+echo "  Zone:     $ZONE"
+echo "══════════════════════════════════════════════════════════"
+
+# ── Step 1: Create VM if it doesn't exist ───────────────────────────
+if gcloud compute instances describe "$VM_NAME" --zone="$ZONE" &>/dev/null; then
+  echo ">> VM '$VM_NAME' already exists, reusing."
+  gcloud compute instances start "$VM_NAME" --zone="$ZONE" 2>/dev/null || true
+else
+  echo ">> Creating VM '$VM_NAME' with $GPU_TYPE GPU..."
+  gcloud compute instances create "$VM_NAME" \
+    --zone="$ZONE" \
+    --machine-type="$MACHINE_TYPE" \
+    --accelerator="$ACCELERATOR" \
+    --maintenance-policy=TERMINATE \
+    --boot-disk-size=200GB \
+    --image-family=pytorch-2-7-cu128-ubuntu-2204-nvidia-570 \
+    --image-project=deeplearning-platform-release \
+    --metadata="install-nvidia-driver=True" \
+    --scopes=default
+fi
+
+# Wait for SSH to be ready
+echo ">> Waiting for SSH..."
+for i in $(seq 1 30); do
+  if gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="echo ok" &>/dev/null; then
+    echo "   SSH ready."
+    break
+  fi
+  sleep 10
+  echo "   retry $i..."
+done
+
+# Resolve remote home directory
+REMOTE_HOME="$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="echo \$HOME" 2>/dev/null)"
+REMOTE_DIR="${REMOTE_HOME}/training"
+echo ">> Remote dir: $REMOTE_DIR"
+
+# ── Step 2: Upload code and data ────────────────────────────────────
+echo ">> Uploading code and data..."
+
+gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="mkdir -p ${REMOTE_DIR}/{data/train,strategies,training,weights}"
+
+# Upload all python files and modules
+gcloud compute scp \
+  "$SCRIPT_DIR/run.py" \
+  "$SCRIPT_DIR/prepare_dataset.py" \
+  "$SCRIPT_DIR/train.py" \
+  "$VM_NAME:${REMOTE_DIR}/" --zone="$ZONE"
+
+gcloud compute scp \
+  "$SCRIPT_DIR/strategies/__init__.py" \
+  "$SCRIPT_DIR/strategies/base.py" \
+  "$SCRIPT_DIR/strategies/yolo_multiclass.py" \
+  "$SCRIPT_DIR/strategies/detection_only.py" \
+  "$SCRIPT_DIR/strategies/two_stage.py" \
+  "$VM_NAME:${REMOTE_DIR}/strategies/" --zone="$ZONE"
+
+gcloud compute scp \
+  "$SCRIPT_DIR/training/__init__.py" \
+  "$SCRIPT_DIR/training/train_detector.py" \
+  "$SCRIPT_DIR/training/train_classifier.py" \
+  "$SCRIPT_DIR/training/extract_crops.py" \
+  "$SCRIPT_DIR/training/validate_pipeline.py" \
+  "$VM_NAME:${REMOTE_DIR}/training/" --zone="$ZONE"
+
+# Upload annotations
+gcloud compute scp \
+  "$SCRIPT_DIR/data/train/annotations.json" \
+  "$VM_NAME:${REMOTE_DIR}/data/train/annotations.json" --zone="$ZONE"
+
+# Upload images only if not already present
+IMAGE_COUNT=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="ls ${REMOTE_DIR}/data/train/images/ 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+if [ "$IMAGE_COUNT" -lt 248 ]; then
+  echo ">> Uploading training images..."
+  gcloud compute scp --recurse \
+    "$SCRIPT_DIR/data/train" \
+    "$VM_NAME:${REMOTE_DIR}/data/" --zone="$ZONE"
+else
+  echo ">> Training images already on VM ($IMAGE_COUNT images), skipping."
+fi
+
+# Upload existing weights so training can compare against previous best
+echo ">> Uploading existing weights (if any) for comparison..."
+for f in classifier.pt ref_embeddings.pt detector.pt best.pt; do
+  if [ -f "$SCRIPT_DIR/weights/$f" ]; then
+    gcloud compute scp "$SCRIPT_DIR/weights/$f" \
+      "$VM_NAME:${REMOTE_DIR}/weights/$f" --zone="$ZONE" 2>/dev/null && \
+      echo "   Uploaded $f" || true
+  fi
+done
+
+# Upload product reference images for classifier training
+if [ "$STRATEGY" = "classifier" ] || [ "$STRATEGY" = "two_stage" ]; then
+  REF_COUNT=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="ls ${REMOTE_DIR}/data/NM_NGD_product_images/ 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+  if [ "$REF_COUNT" -lt 300 ]; then
+    echo ">> Uploading product reference images..."
+    gcloud compute scp --recurse \
+      "$SCRIPT_DIR/data/NM_NGD_product_images" \
+      "$VM_NAME:${REMOTE_DIR}/data/" --zone="$ZONE"
+  else
+    echo ">> Reference images already on VM, skipping."
+  fi
+fi
+
+# ── Step 3: Install dependencies and run training ───────────────────
+echo ">> Installing dependencies and starting training..."
+
+# Build conditional flags for remote command
+FP16_FLAG=""
+if $FP16; then FP16_FLAG="--fp16"; fi
+CLS_CROP_FLAG=""
+if [ -n "$CLS_CROP_SIZE" ]; then CLS_CROP_FLAG="--crop-size ${CLS_CROP_SIZE}"; fi
+
+gcloud compute ssh "$VM_NAME" --zone="$ZONE" --command="
+set -e
+cd ${REMOTE_DIR}
+
+# Install system dependency for OpenCV
+sudo apt-get update -qq && sudo apt-get install -y -qq libgl1-mesa-glx libglib2.0-0
+
+# Use torch 2.5.1 for training (ultralytics 8.1.0 incompatible with torch 2.6 weights_only default)
+# Weights are exported to ONNX, so torch version mismatch with sandbox (2.6.0) is not an issue
+pip install -q torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+pip install -q ultralytics==8.1.0 opencv-python-headless pillow onnxruntime pycocotools
+
+# Verify GPU
+python3 -c 'import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"WARNING: No GPU!\")'
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+case '${STRATEGY}' in
+  detector)
+    echo '=== Training single-class detector ==='
+    python3 -m training.train_detector --mode single --model ${MODEL} --epochs ${EPOCHS} --imgsz ${IMGSZ} --batch ${BATCH} ${FP16_FLAG}
+    ;;
+  multiclass)
+    echo '=== Training multiclass detector ==='
+    python3 -m training.train_detector --mode multi --model ${MODEL} --epochs ${EPOCHS} --imgsz ${IMGSZ} --batch ${BATCH} ${FP16_FLAG}
+    ;;
+  classifier)
+    echo '=== Extracting crops ==='
+    python3 -m training.extract_crops
+    echo '=== Training classifier ==='
+    python3 -m training.train_classifier --epochs ${CLS_EPOCHS} --batch-size ${CLS_BATCH} --patience ${PATIENCE} --arch ${CLS_ARCH} ${CLS_CROP_FLAG} --detector-path ${REMOTE_DIR}/weights/detector.pt --det-imgsz ${IMGSZ}
+    ;;
+  two_stage)
+    echo '=== Phase 1: Training single-class detector ==='
+    python3 -m training.train_detector --mode single --model ${MODEL} --epochs ${EPOCHS} --imgsz ${IMGSZ} --batch ${BATCH} ${FP16_FLAG}
+    echo '=== Phase 2: Extracting crops ==='
+    python3 -m training.extract_crops
+    echo '=== Phase 3: Training classifier ==='
+    python3 -m training.train_classifier --epochs ${CLS_EPOCHS} --batch-size ${CLS_BATCH} --patience ${PATIENCE} --arch ${CLS_ARCH} ${CLS_CROP_FLAG} --detector-path ${REMOTE_DIR}/weights/detector.pt --det-imgsz ${IMGSZ}
+    ;;
+  *)
+    echo 'Unknown strategy: ${STRATEGY}'
+    exit 1
+    ;;
+esac
+
+echo 'Training complete!'
+"
+
+# ── Step 4: Download weights ─────────────────────────────────────────
+echo ">> Downloading trained weights..."
+mkdir -p "$SCRIPT_DIR/weights"
+
+case "$STRATEGY" in
+  detector)
+    DET_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/detector_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$DET_IMPROVED" ]; then
+      echo ">> Detector improved (mAP50=$DET_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
+        "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.pt" \
+        "$SCRIPT_DIR/weights/detector.pt" --zone="$ZONE"
+    else
+      echo ">> Detector did NOT improve — keeping existing local weights."
+    fi
+    ;;
+  multiclass)
+    MC_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/best_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$MC_IMPROVED" ]; then
+      echo ">> Multiclass model improved (mAP50=$MC_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/best.onnx" \
+        "$SCRIPT_DIR/weights/best.onnx" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/best.pt" \
+        "$SCRIPT_DIR/weights/best.pt" --zone="$ZONE"
+    else
+      echo ">> Multiclass model did NOT improve — keeping existing local weights."
+    fi
+    ;;
+  classifier)
+    CLS_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/classifier_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$CLS_IMPROVED" ]; then
+      echo ">> Classifier improved (score=$CLS_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/classifier.pt" \
+        "$SCRIPT_DIR/weights/classifier.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/ref_embeddings.pt" \
+        "$SCRIPT_DIR/weights/ref_embeddings.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/config.json" \
+        "$SCRIPT_DIR/weights/config.json" --zone="$ZONE" 2>/dev/null || true
+    else
+      echo ">> Classifier did NOT improve — keeping existing local weights."
+    fi
+    ;;
+  two_stage)
+    DET_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/detector_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$DET_IMPROVED" ]; then
+      echo ">> Detector improved (mAP50=$DET_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.onnx" \
+        "$SCRIPT_DIR/weights/detector.onnx" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/detector.pt" \
+        "$SCRIPT_DIR/weights/detector.pt" --zone="$ZONE"
+    else
+      echo ">> Detector did NOT improve — keeping existing local weights."
+    fi
+    CLS_IMPROVED=$(gcloud compute ssh "$VM_NAME" --zone="$ZONE" \
+      --command="cat ${REMOTE_DIR}/weights/classifier_updated 2>/dev/null" 2>/dev/null || echo "")
+    if [ -n "$CLS_IMPROVED" ]; then
+      echo ">> Classifier improved (score=$CLS_IMPROVED), downloading weights..."
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/classifier.pt" \
+        "$SCRIPT_DIR/weights/classifier.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/ref_embeddings.pt" \
+        "$SCRIPT_DIR/weights/ref_embeddings.pt" --zone="$ZONE"
+      gcloud compute scp \
+        "$VM_NAME:${REMOTE_DIR}/weights/config.json" \
+        "$SCRIPT_DIR/weights/config.json" --zone="$ZONE" 2>/dev/null || true
+    else
+      echo ">> Classifier did NOT improve — keeping existing local weights."
+    fi
+    ;;
+esac
+
+echo ""
+echo "══════════════════════════════════════════════════════════"
+echo "  Training complete!"
+echo "  Strategy: $STRATEGY"
+echo "  Weights:  $SCRIPT_DIR/weights/"
+echo "══════════════════════════════════════════════════════════"
+
+# ── Step 5: Stop VM to save costs ───────────────────────────────────
+echo ">> Stopping VM to avoid charges..."
+gcloud compute instances stop "$VM_NAME" --zone="$ZONE"
+echo "VM stopped. Run './gcp_train.sh --delete' to fully remove it."

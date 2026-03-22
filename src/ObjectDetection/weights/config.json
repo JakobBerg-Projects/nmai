@@ -1,0 +1,5 @@
+{
+  "arch": "efficientnet_v2_s",
+  "crop_size": 384,
+  "embed_dim": 1280
+}
