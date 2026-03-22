@@ -1,0 +1,5 @@
+anthropic
+fastapi
+uvicorn[standard]
+httpx
+python-multipart
