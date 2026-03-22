@@ -27,8 +27,11 @@ WEIGHTS_DIR = ROOT / "weights"
 SUPPORTED_ARCHS = {
     'resnet50': {'embed_dim': 2048, 'default_crop': 224},
     'efficientnet_v2_s': {'embed_dim': 1280, 'default_crop': 384},
+    'efficientnet_v2_m': {'embed_dim': 1280, 'default_crop': 480},
     'convnext_tiny': {'embed_dim': 768, 'default_crop': 224},
     'convnext_small': {'embed_dim': 768, 'default_crop': 224},
+    'swin_v2_t': {'embed_dim': 768, 'default_crop': 256},
+    'swin_v2_s': {'embed_dim': 768, 'default_crop': 256},
 }
 
 
@@ -58,18 +61,40 @@ def build_backbone(arch, pretrained=True):
         model = convnext_small(weights=weights)
         model.classifier[2] = nn.Identity()
         return model, 768
+    elif arch == 'efficientnet_v2_m':
+        from torchvision.models import efficientnet_v2_m, EfficientNet_V2_M_Weights
+        weights = EfficientNet_V2_M_Weights.DEFAULT if pretrained else None
+        model = efficientnet_v2_m(weights=weights)
+        model.classifier = nn.Identity()
+        return model, 1280
+    elif arch == 'swin_v2_t':
+        from torchvision.models import swin_v2_t, Swin_V2_T_Weights
+        weights = Swin_V2_T_Weights.DEFAULT if pretrained else None
+        model = swin_v2_t(weights=weights)
+        model.head = nn.Identity()
+        return model, 768
+    elif arch == 'swin_v2_s':
+        from torchvision.models import swin_v2_s, Swin_V2_S_Weights
+        weights = Swin_V2_S_Weights.DEFAULT if pretrained else None
+        model = swin_v2_s(weights=weights)
+        model.head = nn.Identity()
+        return model, 768
     else:
         raise ValueError(f"Unknown arch: {arch}. Supported: {list(SUPPORTED_ARCHS.keys())}")
 
 
 def get_train_transform(crop_size):
     return transforms.Compose([
-        transforms.RandomResizedCrop(crop_size, scale=(0.7, 1.0)),
+        transforms.RandomResizedCrop(crop_size, scale=(0.6, 1.0)),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+        transforms.RandomVerticalFlip(p=0.1),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1),
+        transforms.RandAugment(num_ops=2, magnitude=9),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
     ])
 
 
@@ -131,7 +156,8 @@ class EmbeddingClassifier(nn.Module):
 
 def train(epochs: int, batch_size: int, lr: float, patience: int = 10,
           arch: str = 'resnet50', crop_size: int | None = None,
-          detector_path: str | None = None, det_imgsz: int = 1280):
+          detector_path: str | None = None, det_imgsz: int = 1280,
+          best_score_override: float | None = None):
     if crop_size is None:
         crop_size = SUPPORTED_ARCHS[arch]['default_crop']
 
@@ -191,40 +217,55 @@ def train(epochs: int, batch_size: int, lr: float, patience: int = 10,
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    use_amp = device == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_score = 0.0
+    best_run_score = 0.0  # tracks this run's best for early stopping
     weights_updated = False
     epochs_without_improvement = 0
     WEIGHTS_DIR.mkdir(exist_ok=True)
     marker_path = WEIGHTS_DIR / "classifier_updated"
     marker_path.unlink(missing_ok=True)
 
-    # Evaluate existing weights (only if same architecture)
-    existing_weights = WEIGHTS_DIR / "classifier.pt"
-    existing_config = WEIGHTS_DIR / "config.json"
-    existing_arch_matches = False
-    if existing_config.exists():
-        with open(existing_config) as f:
-            prev_config = json.load(f)
-        existing_arch_matches = prev_config.get('arch') == arch
+    # Set baseline score — override takes priority (used for parallel runs)
+    if best_score_override is not None:
+        best_score = best_score_override
+        print(f"=== Using provided baseline score: {best_score:.4f} ===")
+        print(f"  New model ({arch}) must beat {best_score:.4f} to save weights\n")
+    else:
+        # Evaluate existing weights (only if same architecture)
+        existing_weights = WEIGHTS_DIR / "classifier.pt"
+        existing_config = WEIGHTS_DIR / "config.json"
+        existing_arch_matches = False
+        if existing_config.exists():
+            with open(existing_config) as f:
+                prev_config = json.load(f)
+            existing_arch_matches = prev_config.get('arch') == arch
 
-    if existing_weights.exists() and use_combined and existing_arch_matches:
-        print("=== Evaluating existing classifier weights ===")
-        prev_model = EmbeddingClassifier(
-            num_classes=num_classes, arch=arch, pretrained=False,
-        ).to(device)
-        prev_model.backbone.load_state_dict(
-            torch.load(existing_weights, map_location=device, weights_only=True)
-        )
-        prev_combined, prev_det, prev_cls = eval_combined(
-            val_crops, val_gt, prev_model, full_dataset.cat_ids, device,
-            det_mAP50=det_mAP50,
-        )
-        best_score = prev_combined
-        del prev_model
-        print(f"  Existing model score: combined={prev_combined:.4f}  "
-              f"det_mAP50={prev_det:.4f}  cls_mAP50={prev_cls:.4f}")
-        print(f"  New model must beat {best_score:.4f} to save weights\n")
+        if existing_weights.exists() and use_combined and existing_arch_matches:
+            print("=== Evaluating existing classifier weights ===")
+            prev_model = EmbeddingClassifier(
+                num_classes=num_classes, arch=arch, pretrained=False,
+            ).to(device)
+            prev_model.backbone.load_state_dict(
+                torch.load(existing_weights, map_location=device, weights_only=True)
+            )
+            prev_combined, prev_det, prev_cls = eval_combined(
+                val_crops, val_gt, prev_model, full_dataset.cat_ids, device,
+                det_mAP50=det_mAP50,
+            )
+            best_score = prev_combined
+            del prev_model
+            print(f"  Existing model score: combined={prev_combined:.4f}  "
+                  f"det_mAP50={prev_det:.4f}  cls_mAP50={prev_cls:.4f}")
+            print(f"  New model must beat {best_score:.4f} to save weights\n")
+        elif existing_weights.exists() and not existing_arch_matches and marker_path.exists():
+            prev_score = float(marker_path.read_text().strip())
+            best_score = prev_score
+            print(f"=== Existing classifier uses different arch — using saved score ===")
+            print(f"  Previous best score: {best_score:.4f}")
+            print(f"  New model ({arch}) must beat {best_score:.4f} to save weights\n")
 
     for epoch in range(1, epochs + 1):
         # Train
@@ -232,12 +273,14 @@ def train(epochs: int, batch_size: int, lr: float, patience: int = 10,
         total_loss, correct, total = 0.0, 0, 0
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
-            logits = model(imgs)
-            loss = criterion(logits, labels)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits = model(imgs)
+                loss = criterion(logits, labels)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item() * imgs.size(0)
             correct += (logits.argmax(1) == labels).sum().item()
@@ -292,17 +335,22 @@ def train(epochs: int, batch_size: int, lr: float, patience: int = 10,
                   f"macro_acc={macro_acc:.3f}"
                   f"{'  *' if score > best_score else ''}")
 
-        if score > best_score:
-            best_score = score
+        # Early stopping tracks this run's best (not the baseline)
+        if score > best_run_score:
+            best_run_score = score
             epochs_without_improvement = 0
-            weights_updated = True
-            torch.save(model.backbone.state_dict(), WEIGHTS_DIR / "classifier.pt")
-            marker_path.write_text(f"{best_score:.6f}")
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
                 print(f"\nEarly stopping: no improvement for {patience} epochs")
                 break
+
+        # Only save weights if we beat the baseline
+        if score > best_score:
+            best_score = score
+            weights_updated = True
+            torch.save(model.backbone.state_dict(), WEIGHTS_DIR / "classifier.pt")
+            marker_path.write_text(f"{best_score:.6f}")
 
     metric_name = "combined score" if use_combined else "macro accuracy"
     print(f"\nBest val {metric_name}: {best_score:.4f}")
@@ -377,8 +425,11 @@ if __name__ == "__main__":
     parser.add_argument("--detector-path", default=None,
                         help="Path to detector.pt for combined validation")
     parser.add_argument("--det-imgsz", type=int, default=1280)
+    parser.add_argument("--best-score", type=float, default=None,
+                        help="Override baseline score (skip existing weight eval)")
     args = parser.parse_args()
 
     train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
           patience=args.patience, arch=args.arch, crop_size=args.crop_size,
-          detector_path=args.detector_path, det_imgsz=args.det_imgsz)
+          detector_path=args.detector_path, det_imgsz=args.det_imgsz,
+          best_score_override=args.best_score)

@@ -244,3 +244,12 @@ Run around 90 epochs for detection.
   --cls-epochs 100 --cls-batch 64 --patience 15 \
   --cls-arch efficientnet_v2_s \
   --vm-name nmai-a100 --zone us-central1-f
+
+
+./gcp_sweep_classifiers.sh --vm cls-sweep-20260322-012722 --arch convnext_small --crop 224 --batch 96 --lr 5e-4
+
+./gcp_sweep_classifiers.sh --vm nmai-a100 --arch swin_v2_s --crop 256 --batch 64 --lr 5e-4
+
+  ./gcp_sweep_classifiers.sh --vm cls-swinv2t --arch swin_v2_t --crop 256 --batch 96 --lr 5e-4
+
+  ./gcp_sweep_classifiers.sh --vm cls-effv2m --arch efficientnet_v2_m --crop 384 --batch 40 --lr 5e-4

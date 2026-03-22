@@ -40,12 +40,13 @@ TERRAIN_TO_CLASS = {
 }
 
 NUM_CLASSES = 6
-PROB_FLOOR = 0.005
-PRIOR_STRENGTH = 16.0  # Prior pseudo-observations — strong prior; viewport-biased observations need many samples to override
+PROB_FLOOR = 0.02  # Higher floor — protects against KL blowups on rare classes
+PRIOR_STRENGTH = 50.0  # Very high — trust aggregate transition stats over noisy single observations
+MAX_CONFIDENCE = 0.88  # Cap max probability for any dynamic cell
 
 NUM_DIST_BUCKETS = 6
 NUM_SETTLE_DENSITY_BUCKETS = 3  # 0=none, 1=few, 2=many nearby settlements
-LEARNED_MODEL_PATH = os.path.join(os.path.dirname(__file__), "learned_priors_v4.npz")
+LEARNED_MODEL_PATH = os.path.join(os.path.dirname(__file__), "learned_priors_v5.npz")
 
 
 # ---------------------------------------------------------------------------
@@ -435,15 +436,17 @@ def observe_seed(session, round_id, seed_index, initial_state, map_w, map_h,
     if remaining <= 0:
         return counts, obs_count, settlement_fates
 
-    # Smart viewport selection: pick viewports maximizing high-entropy cell coverage
+    # COVERAGE is king: each query should see NEW cells, not repeat old ones.
+    # With stochastic simulation, a single observation is very noisy — but seeing
+    # a cell once is far better than not seeing it at all. Maximize unique coverage.
     if cell_value_map is not None:
-        # Choose number of distinct viewports: aim for 3+ samples per viewport
-        num_distinct = max(1, min(4, remaining // 3))
+        # Use ALL queries for distinct viewports — no repeats
+        num_distinct = remaining
         smart_vps, vp_vals = select_smart_viewports(
             cell_value_map, map_w, map_h, num_distinct)
     else:
-        # Fallback to settlement-focused viewports
-        smart_vps = find_settlement_viewports(initial_state, map_w, map_h, max_viewports=3)
+        # Fallback to tiling viewports for maximum coverage
+        smart_vps = generate_tiling_viewports(map_w, map_h)
         vp_vals = [1.0] * len(smart_vps)
 
     if not smart_vps:
@@ -452,17 +455,8 @@ def observe_seed(session, round_id, seed_index, initial_state, map_w, map_h,
         smart_vps = [(max(0, cx - 7), max(0, cy - 7), min(15, map_w), min(15, map_h))]
         vp_vals = [1.0]
 
-    # Build query plan: distribute queries across viewports weighted by value
-    total_val = sum(vp_vals) or 1.0
-    query_plan = []
-    for i, (vp, val) in enumerate(zip(smart_vps, vp_vals)):
-        n_queries = max(1, round(remaining * val / total_val))
-        for _ in range(n_queries):
-            query_plan.append(vp)
-    # Cap to budget and ensure we use all queries
-    query_plan = query_plan[:remaining]
-    while len(query_plan) < remaining and smart_vps:
-        query_plan.append(smart_vps[0])  # Extra queries go to best viewport
+    # Each viewport gets exactly one query — maximize unique cell coverage
+    query_plan = list(smart_vps[:remaining])
 
     # Log plan
     vp_counts = {}
@@ -829,14 +823,18 @@ def adapt_prior_to_regime(observed_class_freq, per_round_data, global_learned, g
     """
     obs_freq = np.clip(observed_class_freq, 1e-10, None)
     n_rounds = len(per_round_data["round_numbers"])
+    rnd_nums = per_round_data["round_numbers"]
+    max_rnd = max(rnd_nums) if len(rnd_nums) > 0 else 1
 
-    # Compute similarity weight for each historical round using symmetric KL
+    # Compute similarity weight for each historical round using symmetric KL + recency
     weights = np.zeros(n_rounds)
     for i in range(n_rounds):
         hist_freq = np.clip(per_round_data["class_freq"][i], 1e-10, None)
         sym_kl = (np.sum(obs_freq * np.log(obs_freq / hist_freq))
                   + np.sum(hist_freq * np.log(hist_freq / obs_freq)))
-        weights[i] = 1.0 / (sym_kl + 0.01)
+        age = max_rnd - rnd_nums[i]
+        recency = np.exp(-0.05 * age)
+        weights[i] = recency / (sym_kl + 0.01)
 
     weights /= weights.sum()
 
@@ -873,12 +871,17 @@ def adapt_prior_from_initial_state(init_features, per_round_data, global_learned
         weights = np.ones(n_rounds) / n_rounds
     else:
         n_rounds = len(per_round_data["round_numbers"])
+        rnd_nums = per_round_data["round_numbers"]
+        max_rnd = max(rnd_nums) if len(rnd_nums) > 0 else 1
         weights = np.zeros(n_rounds)
         for i in range(n_rounds):
             hist_feat = per_round_data["init_features"][i]
             # Euclidean distance in feature space
             dist = np.sqrt(np.sum((init_features - hist_feat) ** 2))
-            weights[i] = 1.0 / (dist + 0.001)
+            # Recency boost: recent rounds get higher weight
+            age = max_rnd - rnd_nums[i]
+            recency = np.exp(-0.05 * age)  # Gentle decay for older rounds
+            weights[i] = recency / (dist + 0.001)
         weights /= weights.sum()
 
     # Weighted average of per-round priors
@@ -928,11 +931,11 @@ def build_initial_prior(initial_state, map_h, map_w, learned_model=None):
             forest = int(check_adjacent_to_forest(grid, y, x, map_h, map_w))
 
             if cell == 10:  # Ocean — never changes
-                prior[y, x, 0] = 0.98
+                prior[y, x, 0] = 0.96
                 is_static[y, x] = True
 
             elif cell == 5:  # Mountain — never changes
-                prior[y, x, 5] = 0.98
+                prior[y, x, 5] = 0.96
                 is_static[y, x] = True
 
             elif learned is not None:
@@ -1111,100 +1114,139 @@ def build_settlement_adjustments(settlement_fates, map_h, map_w):
 # Prediction: Bayesian posterior combining prior + observations + settlements
 # ---------------------------------------------------------------------------
 
-def sharpen_prior(prior, is_static, dist, temperature=0.8):
-    """Temperature-scale the prior to sharpen confident predictions.
+def estimate_expansion_from_observations(all_counts, all_obs, initial_states, map_h, map_w):
+    """Estimate expansion rate from observations across all seeds.
 
-    Only sharpens cells that are both far from settlements AND already confident
-    (dominant class > 0.7). This avoids over-sharpening uncertain cells near
-    settlements where the outcome is genuinely hard to predict.
+    Returns a dict with:
+      - expansion_rate: fraction of non-static observed cells that became settlement/port/ruin
+      - settle_by_dist: array of shape (NUM_DIST_BUCKETS,) with P(settlement|distance)
+      - port_rate: fraction of observed coastal cells that became ports
+      - ruin_rate: fraction of observed cells that became ruins
+      - total_obs: total observations used
     """
-    sharpened = prior.copy()
-    for y in range(prior.shape[0]):
-        for x in range(prior.shape[1]):
-            if is_static[y, x]:
-                continue
-            d = dist[y, x]
-            max_prob = prior[y, x].max()
+    settle_counts_by_dist = np.zeros(NUM_DIST_BUCKETS, dtype=np.float64)
+    total_by_dist = np.zeros(NUM_DIST_BUCKETS, dtype=np.float64)
+    port_count = 0.0
+    coastal_count = 0.0
+    ruin_count = 0.0
+    total_dynamic = 0.0
+    settle_total = 0.0
 
-            # Only sharpen confident, distant cells
-            if d <= 5 or max_prob < 0.7:
-                continue
+    for si in range(len(initial_states)):
+        grid = initial_states[si]["grid"]
+        settlements = initial_states[si]["settlements"]
+        dist = compute_settlement_distance(settlements, map_h, map_w)
 
-            # Gentle sharpening for far cells, stronger for remote
-            if d <= 8:
-                t = 0.9
-            else:
-                t = temperature
+        for y in range(map_h):
+            for x in range(map_w):
+                if all_obs[si][y, x] <= 0:
+                    continue
+                cell = grid[y][x]
+                if cell == 10 or cell == 5:  # Static
+                    continue
 
-            p = np.clip(prior[y, x], 1e-15, None)
-            log_p = np.log(p) / t
-            log_p -= log_p.max()
-            sharpened[y, x] = np.exp(log_p)
-            sharpened[y, x] = np.maximum(sharpened[y, x], PROB_FLOOR)
-            sharpened[y, x] /= sharpened[y, x].sum()
-    return sharpened
+                n = all_obs[si][y, x]
+                total_dynamic += n
+                db = distance_bucket(dist[y, x])
+
+                # Count settlements (class 1) and ports (class 2)
+                s_count = all_counts[si][y, x, 1]
+                p_count = all_counts[si][y, x, 2]
+                r_count = all_counts[si][y, x, 3]
+
+                settle_total += s_count + p_count
+                settle_counts_by_dist[db] += s_count + p_count
+                total_by_dist[db] += n
+                ruin_count += r_count
+
+                if check_adjacent_to_ocean(grid, y, x, map_h, map_w):
+                    port_count += p_count
+                    coastal_count += n
+
+    expansion_rate = settle_total / max(total_dynamic, 1.0)
+    settle_by_dist = np.zeros(NUM_DIST_BUCKETS, dtype=np.float64)
+    for db in range(NUM_DIST_BUCKETS):
+        if total_by_dist[db] > 0:
+            settle_by_dist[db] = settle_counts_by_dist[db] / total_by_dist[db]
+    port_rate = port_count / max(coastal_count, 1.0)
+    ruin_rate = ruin_count / max(total_dynamic, 1.0)
+
+    print(f"  Expansion estimate: settle_rate={expansion_rate:.3f}, port_rate={port_rate:.3f}, ruin_rate={ruin_rate:.3f}")
+    print(f"    By distance: {', '.join(f'd{i}={settle_by_dist[i]:.3f}' for i in range(NUM_DIST_BUCKETS))}")
+
+    return {
+        "expansion_rate": expansion_rate,
+        "settle_by_dist": settle_by_dist,
+        "port_rate": port_rate,
+        "ruin_rate": ruin_rate,
+        "total_obs": total_dynamic,
+    }
 
 
 def build_prediction(counts, obs_count, initial_state, map_h, map_w,
-                     transitions=None, learned_model=None, settlement_fates=None):
-    """Bayesian posterior with adaptive prior strength and settlement adjustments."""
-    prior, is_static = build_initial_prior(initial_state, map_h, map_w, learned_model)
+                     transitions=None, learned_model=None, settlement_fates=None,
+                     expansion_info=None):
+    """Build prediction using in-round transitions as PRIMARY prior.
+
+    Key insight: aggregate transition statistics from all observations across all
+    seeds accurately capture the current round's hidden parameters — even from
+    noisy single-sample observations. These are far more reliable than per-cell
+    observations or historical learned priors.
+
+    Strategy:
+    - In-round transitions (from cross-seed learning) are the best prior
+    - Global learned prior is only a fallback for unseen feature combinations
+    - Per-cell observations barely influence the prediction (PS=50)
+    - Confidence is capped to prevent catastrophic KL from over-confidence
+    """
+    fallback_prior, is_static = build_initial_prior(initial_state, map_h, map_w, learned_model)
     grid = initial_state["grid"]
     settlements = initial_state["settlements"]
     dist = compute_settlement_distance(settlements, map_h, map_w)
-
-    # Sharpen prior for confident distant cells
-    prior = sharpen_prior(prior, is_static, dist, temperature=0.7)
 
     prediction = np.zeros((map_h, map_w, NUM_CLASSES), dtype=np.float64)
 
     transitions_fine, transitions_coarse = (transitions if transitions is not None
                                             else ({}, {}))
 
-    # Build settlement adjustments if available
-    sett_adj, sett_conf = None, None
-    if settlement_fates:
-        sett_adj, sett_conf = build_settlement_adjustments(settlement_fates, map_h, map_w)
-
     for y in range(map_h):
         for x in range(map_w):
             if is_static[y, x]:
-                prediction[y, x] = prior[y, x]
+                prediction[y, x] = fallback_prior[y, x]
                 continue
 
-            if obs_count[y, x] > 0:
-                n = obs_count[y, x]
-                # Adaptive prior strength: decays slowly — need many observations to override prior
-                effective_ps = PRIOR_STRENGTH / (1.0 + 0.05 * n)
-                alpha = prior[y, x] * effective_ps
-                posterior = (counts[y, x] + alpha) / (n + effective_ps)
+            # Build the best available prior for this cell:
+            # 1. In-round transitions (this round's actual dynamics) — best
+            # 2. Coarse in-round transitions — good
+            # 3. Global learned prior — fallback
+            src = TERRAIN_TO_CLASS.get(grid[y][x], 0)
+            db = distance_bucket(dist[y, x])
+            coastal = int(check_adjacent_to_ocean(grid, y, x, map_h, map_w))
+            key = (src, db, coastal)
 
-                # Blend with settlement fate if available (require >= 5 samples)
-                if sett_adj is not None and sett_conf[y, x] >= 5:
-                    # Weight settlement adjustment conservatively
-                    w_sett = 0.3 * sett_conf[y, x] / (sett_conf[y, x] + n + effective_ps)
-                    prediction[y, x] = (1 - w_sett) * posterior + w_sett * sett_adj[y, x]
-                else:
-                    prediction[y, x] = posterior
-
-            elif transitions_fine or transitions_coarse:
-                src = TERRAIN_TO_CLASS.get(grid[y][x], 0)
-                db = distance_bucket(dist[y, x])
-                coastal = int(check_adjacent_to_ocean(grid, y, x, map_h, map_w))
-                key = (src, db, coastal)
-                if key in transitions_fine:
-                    prediction[y, x] = 0.10 * transitions_fine[key] + 0.90 * prior[y, x]
-                elif src in transitions_coarse:
-                    prediction[y, x] = 0.07 * transitions_coarse[src] + 0.93 * prior[y, x]
-                else:
-                    prediction[y, x] = prior[y, x]
+            if key in transitions_fine:
+                cell_prior = transitions_fine[key]
+            elif src in transitions_coarse:
+                cell_prior = transitions_coarse[src]
             else:
-                prediction[y, x] = prior[y, x]
+                cell_prior = fallback_prior[y, x]
 
-    # Floor and renormalize
-    for _ in range(3):
-        prediction = np.maximum(prediction, PROB_FLOOR)
-        prediction = prediction / prediction.sum(axis=-1, keepdims=True)
+            if obs_count[y, x] > 0:
+                # Bayesian update: strong prior from transitions, barely moved by
+                # noisy single-sample observations
+                n = obs_count[y, x]
+                alpha = cell_prior * PRIOR_STRENGTH
+                prediction[y, x] = (counts[y, x] + alpha) / (n + PRIOR_STRENGTH)
+            else:
+                prediction[y, x] = cell_prior
+
+    # Floor, cap confidence, and renormalize
+    prediction = np.maximum(prediction, PROB_FLOOR)
+    for y in range(map_h):
+        for x in range(map_w):
+            if not is_static[y, x]:
+                prediction[y, x] = np.minimum(prediction[y, x], MAX_CONFIDENCE)
+    prediction = prediction / prediction.sum(axis=-1, keepdims=True)
 
     return prediction
 
@@ -1260,143 +1302,159 @@ def score_prediction(prediction, ground_truth):
 # ---------------------------------------------------------------------------
 
 def backtest(session, detail):
-    """Test prediction quality against a completed round using ground truth."""
+    """Test prediction quality against a completed round using ground truth.
+
+    Simulates the full pipeline: global prior (fallback), in-round transitions
+    (primary), and prediction. No regime detection — matches live mode.
+    """
     round_id = detail["id"]
     map_w = detail["map_width"]
     map_h = detail["map_height"]
     seeds_count = detail["seeds_count"]
     initial_states = detail["initial_states"]
 
-    global_model, per_round = load_learned_priors()
-    has_model = global_model[0] is not None
+    global_model, _per_round = load_learned_priors()
 
-    # Build regime-adapted priors: one from init features (realistic), one from ground truth (oracle)
-    adapted_model = None
-    adapted_model_oracle = None
-    if has_model and per_round is not None:
-        # Realistic: initial-state-based regime detection (what live mode would use)
-        init_features = compute_initial_features(initial_states, map_h, map_w)
-        adapted_learned = adapt_prior_from_initial_state(
-            init_features, per_round, global_model[0], global_model[1],
-        )
-        adapted_model = (adapted_learned, global_model[1])
-
-        # Oracle: ground truth class frequencies (upper bound)
-        resp = session.get(f"{BASE}/astar-island/analysis/{round_id}/0")
-        if resp.status_code == 200:
-            gt0 = np.array(resp.json()["ground_truth"], dtype=np.float64)
-            observed_freq = gt0.mean(axis=(0, 1))
-            adapted_oracle = adapt_prior_to_regime(
-                observed_freq, per_round, global_model[0], global_model[1],
-            )
-            adapted_model_oracle = (adapted_oracle, global_model[1])
-
-    scores_learned = []
-    scores_adapted = []
-    scores_adapted_oracle = []
-    scores_handcoded = []
+    # Fetch all ground truths
+    all_gt = []
     for seed_idx in range(seeds_count):
-        print(f"\n--- Backtesting seed {seed_idx} ---")
-
-        counts = np.zeros((map_h, map_w, NUM_CLASSES), dtype=np.float32)
-        obs_count = np.zeros((map_h, map_w), dtype=np.int32)
-
-        # Prediction with global learned model
-        pred_learned = build_prediction(
-            counts, obs_count, initial_states[seed_idx], map_h, map_w,
-            learned_model=global_model,
-        )
-        pred_learned = np.maximum(pred_learned, PROB_FLOOR)
-        pred_learned = pred_learned / pred_learned.sum(axis=-1, keepdims=True)
-
-        # Prediction with init-features regime-adapted model (realistic)
-        pred_adapted = None
-        if adapted_model is not None:
-            pred_adapted = build_prediction(
-                counts, obs_count, initial_states[seed_idx], map_h, map_w,
-                learned_model=adapted_model,
-            )
-            pred_adapted = np.maximum(pred_adapted, PROB_FLOOR)
-            pred_adapted = pred_adapted / pred_adapted.sum(axis=-1, keepdims=True)
-
-        # Prediction with oracle regime-adapted model (upper bound)
-        pred_adapted_oracle = None
-        if adapted_model_oracle is not None:
-            pred_adapted_oracle = build_prediction(
-                counts, obs_count, initial_states[seed_idx], map_h, map_w,
-                learned_model=adapted_model_oracle,
-            )
-            pred_adapted_oracle = np.maximum(pred_adapted_oracle, PROB_FLOOR)
-            pred_adapted_oracle = pred_adapted_oracle / pred_adapted_oracle.sum(axis=-1, keepdims=True)
-
-        # Prediction with hand-coded fallback only
-        pred_handcoded = build_prediction(
-            counts, obs_count, initial_states[seed_idx], map_h, map_w,
-        )
-        pred_handcoded = np.maximum(pred_handcoded, PROB_FLOOR)
-        pred_handcoded = pred_handcoded / pred_handcoded.sum(axis=-1, keepdims=True)
-
-        # Fetch ground truth
-        resp = session.get(f"{BASE}/astar-island/analysis/{round_id}/{seed_idx}")
+        for _retry in range(3):
+            resp = session.get(f"{BASE}/astar-island/analysis/{round_id}/{seed_idx}")
+            if resp.status_code == 429:
+                time.sleep(2)
+                continue
+            break
         if resp.status_code != 200:
-            print(f"  Could not fetch ground truth: {resp.status_code} {resp.text[:200]}")
+            print(f"  Seed {seed_idx}: no ground truth ({resp.status_code})")
+            all_gt.append(None)
+            continue
+        all_gt.append(resp.json())
+        time.sleep(0.2)
+
+    # Build observations: oracle (full GT) and realistic (smart viewports)
+    gt_counts = []
+    gt_obs = []
+    vp_counts = []
+    vp_obs = []
+    for seed_idx in range(seeds_count):
+        if all_gt[seed_idx] is None:
+            gt_counts.append(np.zeros((map_h, map_w, NUM_CLASSES), dtype=np.float32))
+            gt_obs.append(np.zeros((map_h, map_w), dtype=np.int32))
+            vp_counts.append(np.zeros((map_h, map_w, NUM_CLASSES), dtype=np.float32))
+            vp_obs.append(np.zeros((map_h, map_w), dtype=np.int32))
+            continue
+        gt = np.array(all_gt[seed_idx]["ground_truth"], dtype=np.float64)
+        # Oracle: full map, soft observations (gt probs as counts)
+        gt_counts.append((gt * 10).astype(np.float32))
+        gt_obs.append(np.full((map_h, map_w), 10, dtype=np.int32))
+
+        # Realistic: 10 smart viewports, 1 soft observation per cell
+        cell_value_map = compute_cell_value_map(
+            initial_states[seed_idx], map_h, map_w, global_model)
+        vps_wide, _ = select_smart_viewports(cell_value_map, map_w, map_h, num_viewports=10)
+        vp_mask_wide = np.zeros((map_h, map_w), dtype=bool)
+        for vx, vy, vw, vh in vps_wide:
+            vp_mask_wide[vy:vy+vh, vx:vx+vw] = True
+        vc = np.zeros((map_h, map_w, NUM_CLASSES), dtype=np.float32)
+        vo = np.zeros((map_h, map_w), dtype=np.int32)
+        vc[vp_mask_wide] = gt[vp_mask_wide].astype(np.float32)
+        vo[vp_mask_wide] = 1
+        vp_counts.append(vc)
+        vp_obs.append(vo)
+
+    # Build in-round transitions (PRIMARY prior) from both observation sets
+    transitions_gt = learn_transitions(gt_counts, gt_obs, initial_states, map_h, map_w)
+    transitions_vp = learn_transitions(vp_counts, vp_obs, initial_states, map_h, map_w)
+
+    print(f"\nIn-round transitions: oracle={len(transitions_gt[0])} fine, realistic={len(transitions_vp[0])} fine")
+
+    scores_prior_only = []
+    scores_oracle = []
+    scores_realistic = []
+
+    for seed_idx in range(seeds_count):
+        if all_gt[seed_idx] is None:
             continue
 
-        analysis = resp.json()
-        ground_truth = analysis["ground_truth"]
+        print(f"\n--- Backtesting seed {seed_idx} ---")
+        ground_truth = all_gt[seed_idx]["ground_truth"]
+        server_score = all_gt[seed_idx].get("score")
 
-        score_l = score_prediction(pred_learned, ground_truth)
-        score_h = score_prediction(pred_handcoded, ground_truth)
-        server_score = analysis.get("score")
-        scores_learned.append(score_l)
-        scores_handcoded.append(score_h)
+        counts_zero = np.zeros((map_h, map_w, NUM_CLASSES), dtype=np.float32)
+        obs_zero = np.zeros((map_h, map_w), dtype=np.int32)
 
-        if has_model:
-            print(f"  Global prior score:    {score_l:.2f}")
-            if pred_adapted is not None:
-                score_a = score_prediction(pred_adapted, ground_truth)
-                scores_adapted.append(score_a)
-                print(f"  Adapted (init feat):   {score_a:.2f}  ({score_a - score_l:+.2f})")
-            if pred_adapted_oracle is not None:
-                score_ao = score_prediction(pred_adapted_oracle, ground_truth)
-                scores_adapted_oracle.append(score_ao)
-                print(f"  Adapted (oracle):      {score_ao:.2f}  ({score_ao - score_l:+.2f})")
-            print(f"  Hand-coded prior:      {score_h:.2f}")
-        else:
-            print(f"  Prior-only score: {score_h:.2f}")
+        # 1. Prior-only: global model, no transitions, no observations
+        pred_prior = build_prediction(
+            counts_zero, obs_zero, initial_states[seed_idx], map_h, map_w,
+            learned_model=global_model,
+        )
 
+        # 2. Oracle: global fallback + oracle transitions
+        pred_oracle = build_prediction(
+            counts_zero, obs_zero, initial_states[seed_idx], map_h, map_w,
+            transitions=transitions_gt, learned_model=global_model,
+        )
+
+        # 3. Realistic: global fallback + viewport transitions + viewport obs
+        pred_real = build_prediction(
+            vp_counts[seed_idx], vp_obs[seed_idx], initial_states[seed_idx],
+            map_h, map_w,
+            transitions=transitions_vp, learned_model=global_model,
+        )
+
+        s_prior = score_prediction(pred_prior, ground_truth)
+        s_oracle = score_prediction(pred_oracle, ground_truth)
+        s_real = score_prediction(pred_real, ground_truth)
+
+        scores_prior_only.append(s_prior)
+        scores_oracle.append(s_oracle)
+        scores_realistic.append(s_real)
+
+        print(f"  Prior only:      {s_prior:.2f}")
+        print(f"  Realistic (VP):  {s_real:.2f}  ({s_real - s_prior:+.2f})")
+        print(f"  Oracle (full):   {s_oracle:.2f}  ({s_oracle - s_prior:+.2f})")
         if server_score is not None:
-            print(f"  Server score (last submission): {server_score:.2f}")
+            print(f"  Server (prev):   {server_score:.2f}")
 
-        # Per-class breakdown
-        best_pred = pred_adapted if pred_adapted is not None else (pred_learned if has_model else pred_handcoded)
-        gt = np.array(ground_truth)
-        gt_argmax = gt.argmax(axis=-1)
-        pred_argmax = np.array(best_pred).argmax(axis=-1)
-        class_names = ["Empty", "Settlement", "Port", "Ruin", "Forest", "Mountain"]
-        for cls_idx, cls_name in enumerate(class_names):
-            mask = gt_argmax == cls_idx
-            if mask.sum() > 0:
-                correct = (pred_argmax[mask] == cls_idx).sum()
-                print(f"    {cls_name}: {correct}/{mask.sum()} ({100*correct/mask.sum():.0f}%)")
-
-    if scores_learned:
+    if scores_prior_only:
         print(f"\n--- Backtest Summary ---")
-        if has_model:
-            print(f"Global prior avg:      {np.mean(scores_learned):.2f}  "
-                  f"{[f'{s:.2f}' for s in scores_learned]}")
-            if scores_adapted:
-                print(f"Adapted (init feat):   {np.mean(scores_adapted):.2f}  "
-                      f"{[f'{s:.2f}' for s in scores_adapted]}")
-            if scores_adapted_oracle:
-                print(f"Adapted (oracle):      {np.mean(scores_adapted_oracle):.2f}  "
-                      f"{[f'{s:.2f}' for s in scores_adapted_oracle]}")
-            print(f"Hand-coded prior avg:  {np.mean(scores_handcoded):.2f}  "
-                  f"{[f'{s:.2f}' for s in scores_handcoded]}")
-        else:
-            print(f"Hand-coded prior avg:  {np.mean(scores_handcoded):.2f}  "
-                  f"{[f'{s:.2f}' for s in scores_handcoded]}")
-            print("Run --learn first to compare against learned priors")
+        print(f"Prior only avg:      {np.mean(scores_prior_only):.2f}  "
+              f"{[f'{s:.1f}' for s in scores_prior_only]}")
+        print(f"Realistic (VP) avg:  {np.mean(scores_realistic):.2f}  "
+              f"{[f'{s:.1f}' for s in scores_realistic]}")
+        print(f"Oracle (full) avg:   {np.mean(scores_oracle):.2f}  "
+              f"{[f'{s:.1f}' for s in scores_oracle]}")
+
+
+def backtest_all_rounds(session):
+    """Backtest against all completed rounds to compare strategies."""
+    rounds = session.get(f"{BASE}/astar-island/rounds").json()
+    completed = sorted(
+        [r for r in rounds if r["status"] == "completed"],
+        key=lambda r: r["round_number"],
+    )
+
+    for rnd in completed:
+        rn = rnd["round_number"]
+        print(f"\n{'='*60}")
+        print(f"  ROUND {rn}")
+        print(f"{'='*60}")
+
+        for _retry in range(3):
+            resp = session.get(f"{BASE}/astar-island/rounds/{rnd['id']}")
+            if resp.status_code == 429:
+                time.sleep(2)
+                continue
+            break
+        if resp.status_code != 200:
+            print(f"  Skipping (status {resp.status_code})")
+            continue
+        detail = resp.json()
+        try:
+            backtest(session, detail)
+        except Exception as e:
+            print(f"  Error: {e}")
+        time.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1465,8 @@ def main():
     parser = argparse.ArgumentParser(description="Astar Island solver")
     parser.add_argument("--backtest", nargs="?", const=0, type=int, default=None,
                         help="Test against completed round (default: most recent)")
+    parser.add_argument("--backtest-all", action="store_true",
+                        help="Backtest against all completed rounds we participated in")
     parser.add_argument("--learn", action="store_true",
                         help="Learn priors from all completed rounds")
     parser.add_argument("--quick", action="store_true",
@@ -1419,6 +1479,10 @@ def main():
 
     if args.learn:
         learn_from_history(session)
+        return
+
+    if args.backtest_all:
+        backtest_all_rounds(session)
         return
 
     detail, is_backtest = get_round(session, backtest_round=args.backtest)
@@ -1476,22 +1540,18 @@ def main():
     if cached_total > 0:
         print(f"\n[cache] Found {cached_total} cached queries for this round")
 
-    # Allocate queries proportionally to settlement count
+    # Allocate queries evenly across seeds — each seed needs coverage equally.
+    # Cross-seed learning transfers information, so even coverage is better
+    # than concentrating on high-settlement seeds.
     total_budget = 50
-    settle_counts = [len(initial_states[i]["settlements"]) for i in range(seeds_count)]
-    weights = [max(c, 2) for c in settle_counts]
-    total_w = sum(weights)
-    allocations = [max(5, int(total_budget * w / total_w)) for w in weights]
+    base = total_budget // seeds_count
+    allocations = [base] * seeds_count
     leftover = total_budget - sum(allocations)
-    if leftover > 0:
-        order = sorted(range(seeds_count), key=lambda i: settle_counts[i], reverse=True)
-        for i in range(leftover):
-            allocations[order[i % seeds_count]] += 1
-    elif leftover < 0:
-        order = sorted(range(seeds_count), key=lambda i: settle_counts[i])
-        for i in range(-leftover):
-            if allocations[order[i % seeds_count]] > 5:
-                allocations[order[i % seeds_count]] -= 1
+    # Give extra queries to seeds with more settlements (slight preference)
+    settle_counts = [len(initial_states[i]["settlements"]) for i in range(seeds_count)]
+    order = sorted(range(seeds_count), key=lambda i: settle_counts[i], reverse=True)
+    for i in range(leftover):
+        allocations[order[i % seeds_count]] += 1
 
     print(f"\nQuery allocation: {allocations} (total {sum(allocations)})")
 
@@ -1538,69 +1598,25 @@ def main():
         all_obs.append(obs_count)
         all_fates.append(fates)
 
-    # Phase 2: Regime detection — use initial state features (unbiased), then refine with observations
-    learned_model = global_model  # Default to global
-    if per_round is not None and global_model[0] is not None:
-        # Primary: initial-state-based regime detection (always available, unbiased)
-        init_features = compute_initial_features(initial_states, map_h, map_w)
-        print(f"\nRegime detection from initial state features:")
-        adapted_init = adapt_prior_from_initial_state(
-            init_features, per_round, global_model[0], global_model[1],
-        )
+    # Phase 2: Skip regime detection — it's unreliable across different hidden params.
+    # Instead, use global learned model only as FALLBACK for in-round transitions.
+    learned_model = global_model
+    print(f"\nUsing global learned model as fallback (no regime detection)")
 
-        # Secondary: observation-based regime detection (may be biased by viewport selection)
-        # De-bias by weighting cells inversely proportional to settlement proximity
-        total_class_obs = np.zeros(NUM_CLASSES, dtype=np.float64)
-        total_obs = 0
-        for si in range(seeds_count):
-            mask = all_obs[si] > 0
-            if mask.any():
-                settlements_si = initial_states[si]["settlements"]
-                dist_si = compute_settlement_distance(settlements_si, map_h, map_w)
-                # Weight: cells far from settlements get higher weight to counteract
-                # viewport selection bias toward settlement areas
-                debias_weight = np.clip(dist_si * 0.3 + 0.5, 0.5, 3.0)
-                for cls in range(NUM_CLASSES):
-                    total_class_obs[cls] += (all_counts[si][:, :, cls][mask] * debias_weight[mask]).sum()
-                total_obs += (all_obs[si][mask] * debias_weight[mask]).sum()
-
-        if total_obs > 200:
-            observed_freq = total_class_obs / total_obs
-            class_names = ["Empty", "Sett", "Port", "Ruin", "Forest", "Mtn"]
-            print(f"  Observation-based ({int(total_obs)} obs): " + ", ".join(
-                f"{class_names[i]}={observed_freq[i]:.3f}"
-                for i in range(NUM_CLASSES) if observed_freq[i] > 0.005
-            ))
-            adapted_obs = adapt_prior_to_regime(
-                observed_freq, per_round, global_model[0], global_model[1],
-            )
-            # Blend: 85% init features, 15% observations (init is more reliable;
-            # observations are viewport-biased toward settlement areas)
-            adapted_learned = 0.85 * adapted_init + 0.15 * adapted_obs
-            # Renormalize
-            valid = global_model[1] > 5
-            for idx in np.argwhere(valid):
-                idx_tuple = tuple(idx)
-                adapted_learned[idx_tuple] = np.maximum(adapted_learned[idx_tuple], PROB_FLOOR)
-                adapted_learned[idx_tuple] /= adapted_learned[idx_tuple].sum()
-            learned_model = (adapted_learned, global_model[1])
-        else:
-            print(f"  Using init-features-only regime detection (only {int(total_obs)} observations)")
-            learned_model = (adapted_init, global_model[1])
-
-    # Phase 3: Learn cross-seed transitions (within this round)
+    # Phase 3: Learn cross-seed transitions (within this round) — PRIMARY prior.
+    # Aggregate transition statistics from all observations across all seeds capture
+    # the current round's hidden parameters far better than any historical prior.
     transitions = learn_transitions(all_counts, all_obs, initial_states, map_h, map_w)
     transitions_fine, transitions_coarse = transitions
     print(f"\nLearned in-round transitions: {len(transitions_fine)} fine, {len(transitions_coarse)} coarse")
 
-    # Phase 4: Build and submit predictions with settlement fates
+    # Phase 4: Build and submit predictions — transitions as primary, global as fallback
     for seed_idx in range(seeds_count):
         print(f"\n--- Submitting seed {seed_idx} ---")
-        seed_fates = all_fates[seed_idx] if seed_idx < len(all_fates) else None
         prediction = build_prediction(
             all_counts[seed_idx], all_obs[seed_idx],
             initial_states[seed_idx], map_h, map_w,
-            transitions, learned_model, seed_fates,
+            transitions, learned_model,
         )
 
         # Final safety: ensure valid probabilities
