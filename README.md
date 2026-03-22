@@ -1,34 +1,32 @@
-# nmai
+# NM i AI
 
-Baseline object detection using YOLOv8.
+Solutions for the Norwegian AI Championship (NM i AI).
 
-## Setup
+## Challenges
 
-```bash
-pip install -r requirements.txt
-```
+### Object Detection
 
-## Training
+Two-stage pipeline for detecting and classifying products on store shelves.
 
-Edit `data/dataset.yaml` to point to your dataset, then:
+1. **Detection** — YOLOv8 trained as a binary detector (`nc=1`, product or not) and exported to ONNX. This lets all annotations train a single class, giving more data per class.
+2. **Classification** — ResNet50 fine-tuned as a feature extractor. Reference images for each of the 357 product categories are pre-embedded. Detected crops are classified by cosine similarity against these reference embeddings.
 
-```bash
-python src/train.py
-```
+Splitting detection from classification lets rare categories (few shelf annotations but available reference photos) still be recognised reliably.
 
-## Inference
+### Astar Island
 
-```bash
-python src/detect.py
-```
+Probabilistic terrain prediction for a Viking civilization game, played over multiple rounds with a limited query budget.
 
-## Dataset format
+- Learn transition priors from completed rounds (cross-seed learning).
+- Build features per cell: distance to nearest settlement, coastal/forest adjacency, local settlement density.
+- Select viewports using an entropy-aware value map — prioritise high-uncertainty, settlement-dense areas.
+- Cache observations to disk so priors improve across runs.
 
-Images go in `data/images/train/` and `data/images/val/`.
-Labels go in `data/labels/train/` and `data/labels/val/` (YOLO `.txt` format).
+### AccountingAgentV2
 
-Each label file contains one row per object:
-```
-<class_id> <x_center> <y_center> <width> <height>
-```
-All values normalized to [0, 1].
+AI agent that automates tasks in Tripletex (Norwegian accounting software) via the Claude API.
+
+- **Classify** the task using keyword matching across 7 languages into 20+ task types.
+- **Pre-fetch** reference data (departments, accounts, customers, suppliers, currencies, etc.) so the agent can use IDs directly without extra lookups.
+- **Fast path** — simple tasks are solved in a single tool call, skipping the full agent loop.
+- **High-level tools** bundle multi-step workflows (e.g. create employee, register payment) to minimise API write calls, since each write reduces the score.

@@ -232,13 +232,8 @@ Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size
                  Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100%|██████████| 7/7 [00:05<00:00,  1.40it/s]
                    all         50       4807      0.923      0.919      0.951      0.648
 
-Run around 90 epochs for detection.
 
 
-
-./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 90 --imgsz 1280 --batch 6 --cls-epochs 100 --patience 15 --gpu l4 --zone europe-west1-b
-
-./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 300 --imgsz 1280 --batch 16 --cls-epochs 100 --cls-batch 512 --patience 15 --vm-name instance-20260320-232652 --zone us-central1-f
 
 ./gcp_train.sh --strategy two_stage --model yolov8x.pt --epochs 100 --imgsz 1280 --batch 4 \
   --cls-epochs 100 --cls-batch 64 --patience 15 \
@@ -246,10 +241,3 @@ Run around 90 epochs for detection.
   --vm-name nmai-a100 --zone us-central1-f
 
 
-./gcp_sweep_classifiers.sh --vm cls-sweep-20260322-012722 --arch convnext_small --crop 224 --batch 96 --lr 5e-4
-
-./gcp_sweep_classifiers.sh --vm nmai-a100 --arch swin_v2_s --crop 256 --batch 64 --lr 5e-4
-
-  ./gcp_sweep_classifiers.sh --vm cls-swinv2t --arch swin_v2_t --crop 256 --batch 96 --lr 5e-4
-
-  ./gcp_sweep_classifiers.sh --vm cls-effv2m --arch efficientnet_v2_m --crop 384 --batch 40 --lr 5e-4
